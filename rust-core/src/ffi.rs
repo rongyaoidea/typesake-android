@@ -128,6 +128,9 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_pickCandidate<'local>(
             engine::remember(&p, &w);
         }
         let updated = engine::record_pick(&p, &w, 8);
+        // 生词本 + 译词缓存（这个词从此不再是生词）
+        store::bump_word(&w);
+        crate::gloss::clear_cache();
         let _ = store::persist();
         join(&updated)
     });
@@ -491,8 +494,9 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_statsInfo<'local>(
         let (lex, ini) = engine::lexicon_info();
         let (fuzzy, correction, shuangpin) = engine::options();
         let days = serde_json::to_string(&st.days).unwrap_or_else(|_| "[]".into());
+        let s = store::settings();
         ok_json(&format!(
-            "\"words\":{},\"days\":{},\"saved\":{},\"lex\":{},\"ini\":{},\"endict\":{},\"biglex\":{},\"sentbank\":{},\"fuzzy\":{},\"correction\":{},\"shuangpin\":{},\"script\":{},\"err\":{}",
+            "\"words\":{},\"days\":{},\"saved\":{},\"lex\":{},\"ini\":{},\"endict\":{},\"biglex\":{},\"sentbank\":{},\"fuzzy\":{},\"correction\":{},\"shuangpin\":{},\"script\":{},\"gloss\":{},\"fresh\":{},\"shortcut\":{},\"englishfix\":{},\"cefr\":{},\"err\":{}",
             st.words,
             days,
             store::saved_count(),
@@ -504,7 +508,12 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_statsInfo<'local>(
             fuzzy,
             correction,
             shuangpin,
-            store::settings().script,
+            s.script,
+            s.gloss,
+            s.fresh_mark,
+            s.shortcut,
+            s.english_fix,
+            crate::gloss::levels_loaded(),
             serde_json::to_string(&engine::last_error_snapshot()).unwrap_or_else(|_| "\"\"".into())
         ))
     });
@@ -585,6 +594,189 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_clearSaved<'local>(
     let out = guarded(|| match store::clear_saved() {
         Ok(n) => ok_json(&format!("\"cleared\":{n}")),
         Err(e) => err_json(&e),
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+// ---------------- 多方案 / 逐词译词 / 快捷输入 / 分级 ----------------
+
+/// 可选输入方案清单（设置页直接读，不写死在 Kotlin 里）。
+/// 每项 `编号<US>名称`，项与项用 `<GS>` 分隔。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_schemeList<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let out = guarded(|| {
+        let items: Vec<String> = crate::shuangpin::schemes()
+            .iter()
+            .map(|(id, name)| format!("{id}{FIELD}{name}"))
+            .collect();
+        join(&items)
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 候选旁的逐词译词。每项 `词<US>释义<US>词性<US>生词<US>级别`，项间 `<GS>`。
+/// 译词功能关掉、或这份候选切不出可靠释义时返回空串（宿主只显示中文）。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_glossFor<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    jword: JString<'local>,
+) -> JString<'local> {
+    let w = jstr_to_rust(&mut env, &jword);
+    let out = guarded(|| {
+        let s = store::settings();
+        if !s.gloss {
+            return String::new();
+        }
+        let items: Vec<String> = crate::gloss::segment(&w)
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}",
+                    p.zh,
+                    p.en,
+                    p.pos,
+                    if p.fresh && s.fresh_mark { 1 } else { 0 },
+                    p.level
+                )
+            })
+            .collect();
+        join(&items)
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 一整页候选的行内译词：入参 `词<GS>词<GS>…`，出参每词一组
+/// `短译<US>是否生词<US>级别`，组间 `<GS>`；没有可靠释义的词该组为空串。
+/// 一次 JNI 拿完一页，避免每键跑 8 次跨语言调用。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_glossBatch<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    jwords: JString<'local>,
+) -> JString<'local> {
+    let raw = jstr_to_rust(&mut env, &jwords);
+    let out = guarded(|| {
+        let s = store::settings();
+        if !s.gloss {
+            return String::new();
+        }
+        let groups: Vec<String> = crate::split_delim(&raw)
+            .iter()
+            .map(|w| match crate::gloss::gloss_line(w) {
+                Some((en, level)) => format!(
+                    "{en}{FIELD}{}{FIELD}{level}",
+                    if s.fresh_mark && store::is_fresh(w) {
+                        1
+                    } else {
+                        0
+                    }
+                ),
+                None => String::new(),
+            })
+            .collect();
+        groups.join(&ITEM.to_string())
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 整词短译（「数字键直出译词」用）。没有可靠释义时返回空串。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_shortGloss<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    jword: JString<'local>,
+) -> JString<'local> {
+    let w = jstr_to_rust(&mut env, &jword);
+    let out = guarded(|| {
+        if !store::settings().gloss {
+            return String::new();
+        }
+        crate::gloss::short_gloss(&w).unwrap_or_default()
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 英文模式拼写纠正：把打错的英文词纠正成词表里的真实词；不该改则返回空串。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_fixSpelling<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    jword: JString<'local>,
+) -> JString<'local> {
+    let w = jstr_to_rust(&mut env, &jword);
+    let out = guarded(|| {
+        if !store::settings().english_fix {
+            return String::new();
+        }
+        crate::english::fix_spelling(&w).unwrap_or_default()
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 快捷输入展开：命中返回 `内容<US>分类`（算式/中文数字/金额/字符），否则空串。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_expandShortcut<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    jinput: JString<'local>,
+) -> JString<'local> {
+    let s = jstr_to_rust(&mut env, &jinput);
+    let out = guarded(|| {
+        if !store::settings().shortcut {
+            return String::new();
+        }
+        match crate::shortcut::expand(&s) {
+            Some(h) => format!("{}{FIELD}{}", h.text, h.kind),
+            None => String::new(),
+        }
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 词级分级统计：`{"ok":true,"levels":[["A1",312],…],"terms":12345}`。
+/// 词表没载入时 `levels` 为空数组——不编数字。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_vocabLevels<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let out = guarded(|| {
+        let rows: Vec<(String, usize)> = crate::gloss::vocab_stats();
+        let arr: Vec<String> = rows
+            .iter()
+            .map(|(k, v)| format!("[{},{}]", serde_json::to_string(k).unwrap_or_default(), v))
+            .collect();
+        ok_json(&format!(
+            "\"levels\":[{}],\"terms\":{}",
+            arr.join(","),
+            crate::gloss::levels_loaded()
+        ))
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 写入功能开关（逐词译词 / 生词橙标 / 快捷输入 / 英文纠错）。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_setFeatureOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gloss: jboolean,
+    fresh_mark: jboolean,
+    shortcut: jboolean,
+    english_fix: jboolean,
+) -> JString<'local> {
+    let out = guarded(|| {
+        match store::set_features(gloss != 0, fresh_mark != 0, shortcut != 0, english_fix != 0) {
+            Ok(()) => {
+                crate::gloss::clear_cache();
+                ok_json("\"saved\":1")
+            }
+            Err(e) => err_json(&e),
+        }
     });
     rust_to_jstr(&mut env, &out)
 }

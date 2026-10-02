@@ -33,3 +33,23 @@
 - 上游：<https://github.com/fxsjy/jieba>（`jieba/dict.txt`）
 - 许可：随上游仓库以 **MIT** 分发 <https://github.com/fxsjy/jieba/blob/master/LICENSE>
 - 署名：jieba（"结巴"中文分词）词表，作者 fxsjy 及贡献者。
+
+## CEFR 词级分级表（生成 cefr.tsv）
+
+- 文件：`app/src/main/assets/cefr.tsv`（一行一条 `词<TAB>级别`，共 8690 条 A1..C2；可选产物，缺失时分级统计为空、逐词译词不标级别）
+- 上游（两个数据集合成）：
+  1. **CEFR-J Vocabulary Profile v1.5** — <https://github.com/openlanguageprofiles/olp-en-cefrj>
+     （`cefrj-vocabulary-profile-1.5.csv`）
+  2. **Octanove Vocabulary Profile C1/C2 v1.0** — 同仓库 `octanove-vocabulary-profile-c1c2-1.0.csv`（补 C1/C2 两级）
+- 许可：
+  - CEFR-J：允许**用于研究与商业用途、不收费**，条件是**按要求署名**（见下方引用）。
+    版权归 Tokyo University of Foreign Studies 的 Tono Laboratory（TUFU）。
+    <https://github.com/openlanguageprofiles/olp-en-cefrj/blob/master/README.md>
+  - Octanove C1/C2：**Creative Commons Attribution 4.0 International（CC BY 4.0）**
+    <https://creativecommons.org/licenses/by/4.0/>
+- 必需引用（上游 README 给定的格式）：
+  > The CEFR-J Wordlist Version 1.5. Compiled by Yukio Tono, Tokyo University of Foreign
+  > Studies. Retrieved from <http://www.cefr-j.org/download.html>
+- 说明：合并两份表后**按词去重、同一词取最低（最易）级别**；斜杠分隔的变体
+  （`a.m./A.M./am/AM`）拆开逐个收录；含空格的词组不收（逐词译词只按单词查）。
+  CJK 标题、词性列与两份数据的其余字段未进入本文件。

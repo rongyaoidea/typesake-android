@@ -95,6 +95,12 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
     var statTick by remember { mutableIntStateOf(readyTick) }
     var tick by remember { mutableIntStateOf(readyTick) }
     var shuangpin by remember { mutableIntStateOf(prefs.shuangpin) }
+    var glossOn by remember { mutableStateOf(prefs.gloss) }
+    var freshOn by remember { mutableStateOf(prefs.freshMark) }
+    var shortcutOn by remember { mutableStateOf(prefs.shortcut) }
+    var enFixOn by remember { mutableStateOf(prefs.englishFix) }
+    var blockedApps by remember { mutableStateOf(prefs.blockedApps) }
+    var vocabLevels by remember(tick) { mutableStateOf(TypesakeCore.vocabLevelStats()) }
     var words by remember(tick) { mutableStateOf(TypesakeCore.myWords()) }
     var names by remember(tick) { mutableStateOf(TypesakeCore.myNames()) }
     var script by remember { mutableIntStateOf(prefs.script) }
@@ -344,19 +350,69 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
                 }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("全拼" to 0, "小鹤双拼" to 1).forEach { (label, id) ->
-                if (shuangpin == id) {
-                    Button(onClick = {}) { Text(label) }
-                } else {
-                    OutlinedButton(onClick = {
-                        shuangpin = id
-                        prefs.shuangpin = id
-                        TypesakeCore.setOptions(fuzzy, correction, id, script)
-                    }) { Text(label) }
+        // 输入方案：清单来自引擎（`shuangpin::schemes()`），不在 UI 里写死
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            TypesakeCore.schemes().chunked(3).forEach { rowItems ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    rowItems.forEach { s ->
+                        if (shuangpin == s.id) {
+                            Button(onClick = {}) { Text(s.name) }
+                        } else {
+                            OutlinedButton(onClick = {
+                                shuangpin = s.id
+                                prefs.shuangpin = s.id
+                                TypesakeCore.setOptions(fuzzy, correction, s.id, script)
+                            }) { Text(s.name) }
+                        }
+                    }
                 }
             }
         }
+        SwitchRow("候选旁逐词译词", glossOn) {
+            glossOn = it
+            prefs.gloss = it
+            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+        }
+        SwitchRow("生词橙标（还没上屏过的词）", freshOn) {
+            freshOn = it
+            prefs.freshMark = it
+            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+        }
+        SwitchRow("快捷输入（v 算式 / i 中文数字 / u 码点）", shortcutOn) {
+            shortcutOn = it
+            prefs.shortcut = it
+            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+        }
+        SwitchRow("英文模式拼写纠正", enFixOn) {
+            enFixOn = it
+            prefs.englishFix = it
+            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+        }
+        Text("词汇分级统计（CEFR）", style = MaterialTheme.typography.bodyMedium)
+        if (vocabLevels.isEmpty()) {
+            Text(
+                "词表未载入：把 cefr.tsv 放进词典目录后重启输入法。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            Text(
+                vocabLevels.joinToString("  ") { (lv, n) -> "$lv $n" },
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Text("屏蔽英文候选的应用（包名，每行一个）", style = MaterialTheme.typography.bodyMedium)
+        OutlinedTextField(
+            value = blockedApps,
+            onValueChange = { v ->
+                blockedApps = v
+                prefs.blockedApps = v
+            },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+            maxLines = 4,
+            placeholder = { Text("com.example.notes") },
+            supportingText = { Text("留空 = 所有应用都给英文候选") },
+        )
         var autoSpace by remember { mutableStateOf(prefs.englishAutoSpace) }
         SwitchRow("英文上屏后自动空格", autoSpace) {
             autoSpace = it

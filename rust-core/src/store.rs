@@ -7,6 +7,7 @@
 
 use crate::{biglex, engine, english, gramidx, s2t, sentbank, userdic};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -37,12 +38,24 @@ pub struct Settings {
     /// 击键纠错（邻键/漏键/多键/换位）
     #[serde(default = "default_true")]
     pub correction: bool,
-    /// 双拼方案（0=全拼 1=小鹤）
+    /// 双拼方案（0=全拼 1=小鹤 … 8=大千注音，见 `shuangpin::schemes`）
     #[serde(default)]
     pub shuangpin: u8,
     /// 输出字形（0=简体 1=繁体）
     #[serde(default)]
     pub script: u8,
+    /// 候选旁逐词译词
+    #[serde(default = "default_true")]
+    pub gloss: bool,
+    /// 生词橙标（该词还从没上屏过时标出来）
+    #[serde(default = "default_true")]
+    pub fresh_mark: bool,
+    /// 快捷输入（`v` 算式 / `i` 中文数字 / `u` 码点）
+    #[serde(default = "default_true")]
+    pub shortcut: bool,
+    /// 英文模式拼写纠正
+    #[serde(default = "default_true")]
+    pub english_fix: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +65,10 @@ impl Default for Settings {
             correction: true,
             shuangpin: 0,
             script: 0,
+            gloss: true,
+            fresh_mark: true,
+            shortcut: true,
+            english_fix: true,
         }
     }
 }
@@ -101,6 +118,9 @@ struct Db {
     /// 邮箱域名记忆：(域名, 次数)
     #[serde(default)]
     mail_domains: Vec<(String, u32)>,
+    /// 生词本：中文词 -> 累计上屏次数（0 次 = 生词）
+    #[serde(default)]
+    word_picks: Vec<(String, u32)>,
 }
 
 fn default_version() -> u32 {
@@ -116,7 +136,12 @@ struct Store {
     settings: Settings,
     stats: Stats,
     user_words: Vec<(String, String)>,
+    /// 生词本：词 -> 上屏次数
+    word_picks: HashMap<String, u32>,
 }
+
+/// 生词本容量上限：超了就把计数为 1 的老词整批清掉（保住用得多的）。
+const MAX_WORD_PICKS: usize = 40_000;
 
 fn store() -> &'static Mutex<Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -181,6 +206,7 @@ fn snapshot(s: &Store) -> (String, Db) {
         blocked: engine::export_blocked(),
         user_words: s.user_words.clone(),
         mail_domains: userdic::domains_snapshot(),
+        word_picks: word_picks_sorted(&s.word_picks),
     };
     (s.dir.clone(), db)
 }
@@ -203,7 +229,15 @@ fn empty_db() -> Db {
         blocked: Vec::new(),
         user_words: Vec::new(),
         mail_domains: Vec::new(),
+        word_picks: Vec::new(),
     }
+}
+
+/// 生词本落盘形态：按次数降序、次数相同按字典序，保证写出的文件稳定可比。
+fn word_picks_sorted(m: &HashMap<String, u32>) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = m.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
 }
 
 /// 初始化存储目录：载入收藏 / L0 / 设置 / 统计 / 纠错记忆。返回 (收藏数, pins 数)。
@@ -228,6 +262,8 @@ pub fn init(dir: &str) -> Result<(usize, usize), String> {
     let _ = gramidx::load(&Path::new(dir).join("gram.bin").to_string_lossy());
     // 句库（可选）：CI 生成的 sentbank.bin
     let _ = sentbank::load(&Path::new(dir).join("sentbank.bin").to_string_lossy());
+    // CEFR 词表（可选）：assets 拷来的 cefr.tsv，缺了只是分级统计不显示
+    let _ = crate::gloss::load_levels(&Path::new(dir).join("cefr.tsv").to_string_lossy());
     engine::import_blocked(db.blocked);
     engine::set_options(
         db.settings.fuzzy,
@@ -241,6 +277,7 @@ pub fn init(dir: &str) -> Result<(usize, usize), String> {
     s.settings = db.settings;
     s.stats = db.stats;
     s.user_words = db.user_words;
+    s.word_picks = db.word_picks.into_iter().collect();
     userdic::set_domains(db.mail_domains);
     sync_memory(&s.saved);
     // 预热简拼索引（16.5 万词条遍历一次，避免首次打字时卡一下）
@@ -252,7 +289,7 @@ pub fn settings() -> Settings {
     store_guard().settings.clone()
 }
 
-/// 写入输入选项并落盘。
+/// 写入输入选项并落盘（只动这四个字段，功能开关保留原值）。
 pub fn set_settings(
     fuzzy: bool,
     correction: bool,
@@ -261,12 +298,12 @@ pub fn set_settings(
 ) -> Result<(), String> {
     engine::set_options(fuzzy, correction, shuangpin);
     let mut s = store_guard();
-    s.settings = Settings {
-        fuzzy,
-        correction,
-        shuangpin,
-        script,
-    };
+    let mut ns = s.settings.clone();
+    ns.fuzzy = fuzzy;
+    ns.correction = correction;
+    ns.shuangpin = shuangpin;
+    ns.script = script;
+    s.settings = ns;
     let snap = snapshot(&s);
     drop(s);
     write_snapshot(&snap)?;
@@ -276,6 +313,58 @@ pub fn set_settings(
         script == 1,
     );
     Ok(())
+}
+
+/// 写入功能开关（逐词译词 / 生词橙标 / 快捷输入 / 英文纠错）并落盘。
+pub fn set_features(
+    gloss: bool,
+    fresh_mark: bool,
+    shortcut: bool,
+    english_fix: bool,
+) -> Result<(), String> {
+    let mut s = store_guard();
+    let mut ns = s.settings.clone();
+    ns.gloss = gloss;
+    ns.fresh_mark = fresh_mark;
+    ns.shortcut = shortcut;
+    ns.english_fix = english_fix;
+    s.settings = ns;
+    let snap = snapshot(&s);
+    drop(s);
+    write_snapshot(&snap)
+}
+
+/// 该词是不是生词（还从没上屏过）。词典没数据时也照常返回 true——
+/// 生词本是独立于词典的事实，不需要词表也能判。
+pub fn is_fresh(word: &str) -> bool {
+    let w = word.trim();
+    if w.is_empty() {
+        return false;
+    }
+    let s = store_guard();
+    s.word_picks.get(w).copied().unwrap_or(0) == 0
+}
+
+/// 记一次上屏（选词时调用），用于生词判定与分级统计。
+pub fn bump_word(word: &str) {
+    let w = word.trim();
+    if w.is_empty() {
+        return;
+    }
+    let mut s = store_guard();
+    if s.word_picks.len() >= MAX_WORD_PICKS && !s.word_picks.contains_key(w) {
+        // 满了先清掉只打过一次的，保住用得多的
+        s.word_picks.retain(|_, c| *c > 1);
+    }
+    *s.word_picks.entry(w.to_string()).or_insert(0) += 1;
+}
+
+/// 用户上屏过的词（按次数降序），供分级统计用。
+pub fn picked_words(limit: usize) -> Vec<(String, u32)> {
+    let s = store_guard();
+    let mut v = word_picks_sorted(&s.word_picks);
+    v.truncate(limit);
+    v
 }
 
 /// 修改收藏的英文（收藏可编辑：反哺翻译记忆）。按 (中文, 旧英文) 定位。
@@ -515,6 +604,7 @@ pub fn export_json() -> Result<String, String> {
         blocked: engine::export_blocked(),
         user_words: s.user_words.clone(),
         mail_domains: userdic::domains_snapshot(),
+        word_picks: word_picks_sorted(&s.word_picks),
     };
     serde_json::to_string_pretty(&db).map_err(|e| e.to_string())
 }

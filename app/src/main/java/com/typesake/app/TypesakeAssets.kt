@@ -28,6 +28,7 @@ object TypesakeAssets {
         "lex.bin" to "lex.bin",
         "gram.bin" to "gram.bin",
         "sentbank.bin" to "sentbank.bin",
+        "cefr.tsv" to "cefr.tsv",
     )
 
     private const val KEY_DICT_VERSION = "en_dict_version"

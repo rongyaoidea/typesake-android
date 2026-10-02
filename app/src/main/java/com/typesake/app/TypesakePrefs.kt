@@ -49,10 +49,41 @@ class TypesakePrefs(context: Context) {
         get() = sp.getBoolean(KEY_CORRECTION, true)
         set(v) = sp.edit().putBoolean(KEY_CORRECTION, v).apply()
 
-    /** 双拼方案（0 全拼 1 小鹤） */
+    /** 输入方案（0 全拼 1 小鹤 … 8 大千注音，可用清单见 `TypesakeCore.schemes()`） */
     var shuangpin: Int
         get() = sp.getInt(KEY_SHUANGPIN, 0)
-        set(v) = sp.edit().putInt(KEY_SHUANGPIN, v.coerceIn(0, 1)).apply()
+        set(v) = sp.edit().putInt(KEY_SHUANGPIN, v.coerceIn(0, MAX_SCHEME)).apply()
+
+    /** 候选旁逐词译词 */
+    var gloss: Boolean
+        get() = sp.getBoolean(KEY_GLOSS, true)
+        set(v) = sp.edit().putBoolean(KEY_GLOSS, v).apply()
+
+    /** 生词橙标（该词还从没上屏过时标出来） */
+    var freshMark: Boolean
+        get() = sp.getBoolean(KEY_FRESH, true)
+        set(v) = sp.edit().putBoolean(KEY_FRESH, v).apply()
+
+    /** 快捷输入（v 算式 / i 中文数字 / u 码点） */
+    var shortcut: Boolean
+        get() = sp.getBoolean(KEY_SHORTCUT, true)
+        set(v) = sp.edit().putBoolean(KEY_SHORTCUT, v).apply()
+
+    /** 英文模式拼写纠正 */
+    var englishFix: Boolean
+        get() = sp.getBoolean(KEY_EN_FIX, true)
+        set(v) = sp.edit().putBoolean(KEY_EN_FIX, v).apply()
+
+    /** 这些应用里不给英文候选（换行分隔的包名；空 = 所有应用都给） */
+    var blockedApps: String
+        get() = sp.getString(KEY_BLOCK_APPS, "") ?: ""
+        set(v) = sp.edit().putString(KEY_BLOCK_APPS, v).apply()
+
+    /** 当前应用是否被「不给英文候选」拦住了 */
+    fun englishBlockedFor(pkg: String?): Boolean {
+        if (pkg.isNullOrEmpty()) return false
+        return blockedApps.lineSequence().any { it.trim() == pkg }
+    }
 
     /** 键盘布局（false 全键盘 / true 九键） */
     var t9Layout: Boolean
@@ -130,6 +161,12 @@ class TypesakePrefs(context: Context) {
         const val MIN_KEY_HEIGHT = 34
         const val MAX_KEY_HEIGHT = 62
 
+        /** 方案编号上限（0 全拼 … 8 大千注音），与 Rust `shuangpin::schemes()` 对齐 */
+        const val MAX_SCHEME = 8
+
+        /** 大千注音：击键里含 `,` `.` `;` `/` `-` 与 0-9，与选词/翻页键冲突，要单独处理 */
+        const val SCHEME_ZHUYIN = 8
+
         /** 旧版本可能存过越界值 -> 读取时兜底 */
         fun sanitizeKeyHeight(v: Int): Int = v.coerceIn(MIN_KEY_HEIGHT, MAX_KEY_HEIGHT)
 
@@ -156,5 +193,10 @@ class TypesakePrefs(context: Context) {
         private const val KEY_CAND_INDEX = "candidate_index"
         private const val KEY_HAPTIC_LEVEL = "haptic_level"
         private const val KEY_DYNAMIC = "dynamic_color"
+        private const val KEY_GLOSS = "gloss_inline"
+        private const val KEY_FRESH = "fresh_mark"
+        private const val KEY_SHORTCUT = "shortcut_input"
+        private const val KEY_EN_FIX = "english_fix"
+        private const val KEY_BLOCK_APPS = "blocked_english_apps"
     }
 }

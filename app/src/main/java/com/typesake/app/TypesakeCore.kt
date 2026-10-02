@@ -122,6 +122,19 @@ object TypesakeCore {
     @JvmStatic private external fun savePhrase(chinese: String, english: String): String
     @JvmStatic private external fun listSaved(): String
     @JvmStatic private external fun clearSaved(): String
+    @JvmStatic private external fun schemeList(): String
+    @JvmStatic private external fun glossFor(word: String): String
+    @JvmStatic private external fun glossBatch(words: String): String
+    @JvmStatic private external fun shortGloss(word: String): String
+    @JvmStatic private external fun fixSpelling(word: String): String
+    @JvmStatic private external fun expandShortcut(input: String): String
+    @JvmStatic private external fun vocabLevels(): String
+    @JvmStatic private external fun setFeatureOptions(
+        gloss: Boolean,
+        freshMark: Boolean,
+        shortcut: Boolean,
+        englishFix: Boolean,
+    ): String
 
     // ---- 解析工具（internal 供单测） ----
 
@@ -266,6 +279,112 @@ object TypesakeCore {
     fun t9(digits: String): List<String> =
         if (!available) fallbackCandidates(digits)
         else runCatching { splitDelim(t9Candidates(digits)) }.getOrDefault(emptyList())
+
+    // ---- 逐词译词 / 多方案 / 快捷输入 / 分级 ----
+
+    /** 一个可选输入方案。 */
+    data class Scheme(val id: Int, val name: String)
+
+    /** 可选方案清单（0 全拼 … 8 大千注音），来源是引擎，不在 Kotlin 里写死。 */
+    fun schemes(): List<Scheme> {
+        if (!available) return listOf(Scheme(0, "全拼"))
+        return runCatching {
+            splitDelim(schemeList()).mapNotNull { item ->
+                val p = item.split(FIELD)
+                if (p.size < 2) null else Scheme(p[0].toIntOrNull() ?: return@mapNotNull null, p[1])
+            }
+        }.getOrDefault(listOf(Scheme(0, "全拼")))
+    }
+
+    /** 候选行内的一行译词。`level` 为空表示词表没收录该词。 */
+    data class GlossLine(val text: String, val fresh: Boolean, val level: String)
+
+    /**
+     * 一次取一整页候选的行内译词。返回列表与入参**等长**，
+     * 没有可靠释义的位置是 null（调用方据此决定不显示译词，而不是显示猜的）。
+     */
+    fun glossLines(words: List<String>): List<GlossLine?> {
+        if (!available || words.isEmpty()) return words.map { null }
+        return runCatching {
+            val groups = glossBatch(words.joinToString(DELIM.toString())).split(DELIM)
+            words.mapIndexed { i, _ ->
+                val g = groups.getOrNull(i).orEmpty()
+                if (g.isEmpty()) null else {
+                    val p = g.split(FIELD)
+                    GlossLine(
+                        text = p.getOrNull(0).orEmpty(),
+                        fresh = p.getOrNull(1) == "1",
+                        level = p.getOrNull(2).orEmpty(),
+                    ).takeIf { it.text.isNotEmpty() }
+                }
+            }
+        }.getOrDefault(words.map { null })
+    }
+
+    /** 逐词译词明细（长按候选时展示：每段的 中文 / 释义 / 词性 / 生词 / 级别）。 */
+    data class GlossWord(
+        val zh: String,
+        val en: String,
+        val pos: String,
+        val fresh: Boolean,
+        val level: String,
+    )
+
+    fun glossDetail(word: String): List<GlossWord> {
+        if (!available || word.isEmpty()) return emptyList()
+        return runCatching {
+            splitDelim(glossFor(word)).mapNotNull { item ->
+                val p = item.split(FIELD)
+                if (p.size < 5) null else GlossWord(
+                    zh = p[0], en = p[1], pos = p[2],
+                    fresh = p[3] == "1", level = p[4],
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 整词短译（数字键直出译词用）；没有可靠释义返回空串。 */
+    fun shortGlossOf(word: String): String =
+        if (!available) "" else runCatching { shortGloss(word) }.getOrDefault("")
+
+    /**
+     * 英文模式拼写纠正：把打错的词换成词表里的真实词，不该改时返回空串。
+     * 引擎侧按 `english_fix` 开关生效，这里只负责兜住未加载的情形。
+     */
+    fun spellingFix(word: String): String =
+        if (!available) "" else runCatching { fixSpelling(word) }.getOrDefault("")
+
+    /** 快捷输入命中。 */
+    data class Shortcut(val text: String, val kind: String)
+
+    /** `v1+2` / `i123` / `im123.45` / `u4e00` 命中时返回展开结果，否则 null。 */
+    fun shortcutOf(input: String): Shortcut? {
+        if (!available) return null
+        return runCatching {
+            val raw = expandShortcut(input)
+            if (raw.isEmpty()) null else {
+                val p = raw.split(FIELD)
+                if (p.isEmpty() || p[0].isEmpty()) null else Shortcut(p[0], p.getOrNull(1).orEmpty())
+            }
+        }.getOrDefault(null)
+    }
+
+    /** 词级分级统计：`[("A1", 312), …]`。词表没载入时为空。 */
+    fun vocabLevelStats(): List<Pair<String, Int>> {
+        if (!available) return emptyList()
+        return runCatching {
+            Regex("\\[\"([ABC][12])\",(\\d+)]")
+                .findAll(vocabLevels())
+                .map { m -> m.groupValues[1] to (m.groupValues[2].toIntOrNull() ?: 0) }
+                .toList()
+        }.getOrDefault(emptyList())
+    }
+
+    /** 写入功能开关（逐词译词 / 生词橙标 / 快捷输入 / 英文纠错），会落盘。 */
+    fun setFeatures(gloss: Boolean, freshMark: Boolean, shortcut: Boolean, englishFix: Boolean) {
+        if (!available) return
+        runCatching { setFeatureOptions(gloss, freshMark, shortcut, englishFix) }
+    }
 
     /** 编辑收藏英文（反哺翻译记忆）。 */
     fun editSaved(chinese: String, oldEnglish: String, newEnglish: String): Boolean {

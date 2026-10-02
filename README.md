@@ -81,8 +81,10 @@ Viterbi 整句组合 + bigram 联想 + L0 用户学习层）；`trigrams` 特性
 
 ## A 级输入增强 / B 级学习闭环（本轮）
 
-- **双拼**：小鹤方案（`rust-core/src/shuangpin.rs`，纯数据表 + 400 音节往返自检），
-  设置里可切「全拼 / 小鹤双拼」；显示"击键→全拼"
+- **双拼 + 注音**：`rust-core/src/shuangpin.rs` 纯数据表 + 音节往返自检，共 **9 套方案**
+  （全拼 / 小鹤 / 自然码 / 微软 / 搜狗 / 智能ABC / 小浪 / 首道 / 大千注音），
+  设置页一键切换；击键在**唯一入口** `engine::canonical()` 归一成全拼再进引擎，
+  解码不幂等（`to_full("xue")` → `xiue`），所以内部路径绝不再过一遍
 - **上下文重排**：每次上屏把词喂给引擎，用 bigram 对前 5 个候选重排（`setContext`）
 - **误纠错一键还原**：纠错命中时候选条多一个「原样 xxx」，可原样上屏
 - **候选翻页**：候选条末尾「更多 ▸」弹层，最多 24 条
@@ -140,6 +142,39 @@ Viterbi 整句组合 + bigram 联想 + L0 用户学习层）；`trigrams` 特性
   选词/整句排序都用「词频 + 常用词奖励 + bigram」；连续缩写必须整体成词，否则宁缺勿滥
 - 待做：逐段确认/自动上屏、纠错只作用于末段
 
+## 本轮对标新增（译词 / 分级 / 快捷输入 / 纠错 / 评测）
+
+**候选旁逐词译词（`rust-core/src/gloss.rs`）**
+- 候选词切成词段，每段给第 1 义、剥开头括注、截 48 字符的英文短译
+- 宁缺毋滥：整条覆盖率 < 60% 或切不出词段就整条不给
+- 长按候选 → **明细**，逐段列出 词 / 词性 / 英文 / 级别 / 生词
+- 数字键直出译词：候选条「译●」开关，开着时按数字键上屏的是该候选的英文释义
+
+**生词橙标**
+- 判据是 `store::is_fresh()`（上屏次数 == 0），候选上挂橙点、随使用逐渐消退
+- 首次启动时常用词也是橙的——没有足够大的"常见词"表可用来门控，这是取舍而非缺陷
+
+**CEFR 词汇分级**
+- `app/src/main/assets/cefr.tsv`：A1..C2 一词一行（8690 条），Rust 侧 `vocab_stats()` 出统计
+- 设置页展示分级计数；逐词译词顺带标该词级别（见 `THIRD_PARTY_NOTICES.md` 的来源与许可）
+
+**快捷输入（`rust-core/src/shortcut.rs`）**
+- `v` 算式（`v1+2*3`）、`i` 中文数字（`i12345`）、`im` 大写金额（`im123.45`）、`u` 码点（`u65`→`A`）
+- **只有形状被坐实时才接管**：双拼里 `v`/`i`/`u` 是正常击键，形状断了立刻清缓冲回落；
+  数字键若有对应候选则让位给选词（`im` 入口只在全拼下开放）
+- 回车 / 空格 / 点候选 = 上屏算好的结果
+
+**英文模式拼写纠正**
+- 开了才把当前词放进 composing 区（关着则保持原来的逐键直接上屏），空格 / 回车上屏纠正后的词
+- 词表取自 `en_dict.tsv` 的英文侧，按需懒建（不用这个功能的人不占这份内存）
+- 编辑距离预算：≤4 字母容 1 处、更长容 2 处；比「距离 → 首字母 → 长度差」，平手取字典序靠前者。
+  对不上就一个字都不改（宁可不纠正也不乱改）
+- 按应用屏蔽：设置里填包名（每行一个），这些应用不注入英文候选、也不纠错
+
+**回放评测 CLI（`rust-core/src/bin/replay.rs`）**
+- `cargo run --bin replay -- --limit 50 --scheme 1` → 报 top-1 / top-5 命中率与覆盖率
+- 用例来自词典**等间隔跨全书采样 + 定种子洗牌**（可复现）；改键位表后先跑它再谈别的
+
 ## 图标
 
 手绘线条稿（键帽 = 打字，A = 英语，笔迹 + 落点 = 书写/学习）：
@@ -157,6 +192,9 @@ Viterbi 整句组合 + bigram 联想 + L0 用户学习层）；`trigrams` 特性
 cargo fmt --manifest-path rust-core/Cargo.toml -- --check
 cargo clippy --manifest-path rust-core/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path rust-core/Cargo.toml --release
+
+# 改了键位表 / 排序后跑一遍回放评测（top-1 / top-5 命中率）
+cargo run --manifest-path rust-core/Cargo.toml --bin replay -- --limit 500 --scheme 1
 ```
 
 完整 APK 走 GitHub Actions（本机 PRoot 无 Android SDK platform）。
@@ -196,6 +234,8 @@ cargo test --manifest-path rust-core/Cargo.toml --release
 - 代码：MIT
 - 词典数据 `app/src/main/assets/en_dict.tsv`：CC-CEDICT，**CC BY-SA 4.0**（可能修改过），
   署名与再分发要求见 `THIRD_PARTY_NOTICES.md`
+- 词级分级表 `app/src/main/assets/cefr.tsv`：CEFR-J Wordlist v1.5（可商用、需署名）
+  + Octanove C1/C2 v1.0（CC BY 4.0）合成，出处与引用格式见 `THIRD_PARTY_NOTICES.md`
 
 ## 已知边界
 
@@ -203,3 +243,11 @@ cargo test --manifest-path rust-core/Cargo.toml --release
   （AI 增强：本地小模型 / 云端改写为后续工作）
 - 整句组合（Viterbi）走的是无 trigram 的 bigram 排序，长句优先级以词频为主
 - 剪贴板历史不落盘，退出即清空（隐私优先）
+- **大千注音没有专属键盘布局**：仍用字母键盘 + 数字行 + `?123` 符号页。注音击键里的
+  `0-9` `,` `.` `;` `/` `-` 与选词/翻页/句号键撞车，现按方案分流（`zhuyinInput()`）：
+  数字与 `-` 永远进组合区，`,.` `;` `/` 只在组合中或主键区当注音键，符号页的 `，` `。`
+  仍是普通标点。代价是：注音模式下**主键区那个 `.` 是 ㄡ 而不是句号**（句号请用符号页）、
+  **打不出半角连字符 `-`**、独立的 ㄦ 需先按数字行的任意键进入组合再按 `-`。
+  专属注音键位层（直接把键标成 ㄅ ㄆ ㄇ…）待做
+- 生词橙标首启时几乎全是橙点：没有足够大的「常见词」表能用来门控，靠使用逐步消退
+- 分级表 `cefr.tsv` 缺失时（可选产物）分级统计为空、译词不标级别，其余功能不受影响

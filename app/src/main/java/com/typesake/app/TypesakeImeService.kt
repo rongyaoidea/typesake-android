@@ -8,6 +8,10 @@ import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.SystemClock
 import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -89,6 +93,25 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private var kind = KbKind.QWERTY
     private var layer = KbLayer.LETTERS
     private var privateField = false
+
+    /** 当前编辑框所属应用包名（「按应用不给英文候选」用） */
+    private var currentPkg: String? = null
+
+    /** 快捷输入缓冲：`v1+2` / `i123` / `im123.45` / `u4e00`；空 = 不在快捷输入中 */
+    private val scBuf = StringBuilder()
+
+    /** 快捷输入的分类标签（算式/中文数字/金额/字符），空 = 还没算出来 */
+    private var scKind = ""
+
+    /** 数字键直出译词：开着时按数字键上屏的是英文释义而不是中文候选 */
+    private var translateOut = false
+
+    /** 英文模式正在拼的词（拼写纠正需要一个「未定稿」的区域才能给候选） */
+    private val enBuf = StringBuilder()
+
+    /** 上面这个词的纠正结果；空 = 没打错 / 不该改 */
+    private var enFix = ""
+
     private var colors: KbColors = KbThemes.resolve(0, 0, false)
 
     private val clipItems = ArrayDeque<String>()
@@ -182,6 +205,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         englishMode = KbLayouts.prefersEnglish(inputType)
         kind = KbLayouts.kindForInputType(inputType)
         privateField = KbLayouts.learningDisabled(inputType)
+        currentPkg = info?.packageName
         if (privateField) clearComposing()
     }
 
@@ -301,6 +325,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private fun clearComposing() {
         pinyin.setLength(0)
         t9buf.setLength(0)
+        scBuf.setLength(0)
+        scKind = ""
+        enBuf.setLength(0)
+        enFix = ""
         candidates = emptyList()
         match = null
         lastCommittedChinese = ""
@@ -340,6 +368,32 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             return
         }
 
+        // 0.5) 快捷输入中（v 算式 / i 中文数字 / im 金额 / u 码点）
+        if (scBuf.isNotEmpty()) {
+            val hit = TypesakeCore.shortcutOf(scBuf.toString())
+            candidateRow.addView(textLabel(scBuf.toString(), colors.accent, colors.barBg))
+            if (hit == null) {
+                candidateRow.addView(
+                    textLabel(
+                        if (scKind.isEmpty()) "继续输入符号/数字，空格上屏结果" else scKind,
+                        colors.hint,
+                        colors.barBg,
+                    )
+                )
+            } else {
+                candidateRow.addView(
+                    chip(
+                        "→ ${hit.text}",
+                        colors.accentText,
+                        colors.accent,
+                        onClick = { commitShortcut() },
+                    )
+                )
+                candidateRow.addView(chip(hit.kind, colors.hint, colors.key))
+            }
+            return
+        }
+
         // 1) 拼音输入中
         if (pinyin.isNotEmpty()) {
             val m = match
@@ -370,12 +424,29 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 }
                 candidateRow.addView(textLabel(hint, colors.hint, colors.barBg))
             } else {
+                // 候选旁逐词译词：一次 JNI 取回整页，查不到释义的位置是 null
+                val glosses =
+                    if (prefs.gloss) TypesakeCore.glossLines(list) else list.map { null }
                 for ((i, word) in list.withIndex()) {
                     candidateRow.addView(
                         candidateChip(
                             label = if (i < 9 && !paged && prefs.showCandidateIndex) "${i + 1} $word" else word,
                             word = word,
+                            gloss = glosses.getOrNull(i),
                         )
+                    )
+                }
+                if (prefs.gloss) {
+                    // 数字键直出译词：开着时按数字键上屏的是这条候选的英文释义
+                    candidateRow.addView(
+                        chip(
+                            if (translateOut) "译●" else "译",
+                            if (translateOut) colors.accentText else colors.hint,
+                            if (translateOut) colors.accent else colors.key,
+                        ) {
+                            translateOut = !translateOut
+                            renderCandidates()
+                        }
                     )
                 }
             }
@@ -485,6 +556,36 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         englishRow.removeAllViews()
         applyBarBackground(englishScroll)
 
+        // 按应用不给英文候选：屏蔽名单里的应用只留操作按钮，不注入任何英文
+        if (prefs.englishBlockedFor(currentPkg)) {
+            englishRow.addView(chip("已隐藏此应用的英文候选", colors.hint, colors.barBg))
+            if (!privateField) {
+                englishRow.addView(chip("★", colors.accentText, colors.accent, onClick = { saveCurrentSentence() }))
+            }
+            englishRow.addView(chip("学", colors.accentText, colors.accent, onClick = { onOpenHub() }))
+            return
+        }
+        // 英文模式：当前正在拼的词（纠正候选就挂在这里，空格上屏时才生效）
+        if (englishMode && enBuf.isNotEmpty()) {
+            englishRow.addView(chip(enBuf.toString(), colors.accent, colors.barBg))
+            if (enFix.isNotEmpty()) {
+                englishRow.addView(
+                    chip(
+                        "→$enFix",
+                        colors.accentText,
+                        colors.key,
+                        onClick = { acceptEnglishFix() },
+                    )
+                )
+            } else {
+                englishRow.addView(chip("没打错", colors.hint, colors.barBg))
+            }
+            if (!privateField) {
+                englishRow.addView(chip("★", colors.accentText, colors.accent, onClick = { saveCurrentSentence() }))
+            }
+            englishRow.addView(chip("学", colors.accentText, colors.accent, onClick = { onOpenHub() }))
+            return
+        }
         if (composingInfo.isNotEmpty()) {
             englishRow.addView(chip(composingInfo, colors.accent, colors.barBg))
         }
@@ -520,13 +621,61 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         englishRow.addView(chip("学", colors.accentText, colors.accent, onClick = { onOpenHub() }))
     }
 
+    /**
+     * 英文模式：重算当前词的纠正结果。
+     *
+     * 纠正给得非常克制——`english_fix` 关着、词太短/不是词、或词表里没有更接近的词，
+     * 一律返回空串（界面上就只显示原词，不会凭空冒出一个"修正"）。
+     * 首字母大小写跟原词走，否则 `Hello` 会被改成 `hello`。
+     */
+    private fun updateEnglishFix() {
+        val raw = enBuf.toString()
+        if (!prefs.englishFix || raw.isEmpty()) {
+            enFix = ""
+            return
+        }
+        val fixed = TypesakeCore.spellingFix(raw)
+        enFix = when {
+            fixed.isEmpty() -> ""
+            raw.first().isUpperCase() -> fixed.replaceFirstChar { it.uppercaseChar() }
+            else -> fixed
+        }
+    }
+
+    /** 把英文模式当前词上屏（`preferred` 指定用哪个词，空则用纠正结果，再没有就原样）。 */
+    private fun commitEnglishWord(preferred: String? = null) {
+        val raw = enBuf.toString()
+        if (raw.isEmpty()) return
+        val word = preferred?.takeIf { it.isNotEmpty() } ?: enFix.ifEmpty { raw }
+        enBuf.setLength(0)
+        enFix = ""
+        val ic = currentInputConnection
+        ic?.setComposingText("", 0)
+        ic?.commitText(word, 1)
+        selfEdit = true
+        digitRun.setLength(0)
+        renderEnglish()
+    }
+
+    /** 点了「→ 修正」：直接按纠正后的词上屏。 */
+    private fun acceptEnglishFix() {
+        if (enFix.isEmpty()) return
+        commitEnglishWord(enFix)
+    }
+
     /** 中文候选：字号更大（主视觉），支持长按置顶/删词。 */
-    private fun candidateChip(label: String, word: String): TextView {
+    private fun candidateChip(
+        label: String,
+        word: String,
+        gloss: TypesakeCore.GlossLine? = null,
+    ): TextView {
         // 注意：GradientDrawable 自己也有 colors 属性，apply 里必须显式取外层字段
         val keyColor = colors.key
         val textColor = colors.keyText
+        val accent = colors.accent
+        val hint = colors.hint
         return TextView(this).apply {
-            text = label
+            text = candidateLabel(label, gloss, accent, hint)
             setTextColor(textColor)
             textSize = 16f
             maxLines = 1
@@ -541,6 +690,40 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             setOnLongClickListener { showCandidateActions(word); true }
             layoutParams = chipParams()
         }
+    }
+
+    /**
+     * 候选文案：`1 今天  ●  today`。
+     * 生词加一个橙点并把译词染成主题强调色，其余译词用弱化色的小字。
+     */
+    private fun candidateLabel(
+        label: String,
+        gloss: TypesakeCore.GlossLine?,
+        accent: Int,
+        hint: Int,
+    ): CharSequence {
+        if (gloss == null || gloss.text.isEmpty()) return label
+        val sb = SpannableStringBuilder(label)
+        val spanFlags = Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        if (gloss.fresh) {
+            val start = sb.length
+            sb.append(" ●")
+            sb.setSpan(RelativeSizeSpan(0.5f), start, sb.length, spanFlags)
+            sb.setSpan(ForegroundColorSpan(accent), start, sb.length, spanFlags)
+        }
+        val text = if (gloss.text.length > 20) gloss.text.take(19) + "…" else gloss.text
+        val body = if (gloss.level.isEmpty()) text else "$text ${gloss.level}"
+        val from = sb.length
+        sb.append("  ")
+        sb.append(body)
+        sb.setSpan(RelativeSizeSpan(0.62f), from, sb.length, spanFlags)
+        sb.setSpan(
+            ForegroundColorSpan(if (gloss.fresh) accent else hint),
+            from,
+            sb.length,
+            spanFlags,
+        )
+        return sb
     }
 
     /** 英文/操作条：字号更小（次要信息）。 */
@@ -630,6 +813,30 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 )
             }
         }
+        // 上屏译词：不打拼音选词，直接把该候选的英文释义上屏
+        run {
+            val en = TypesakeCore.shortGlossOf(word)
+            if (en.isNotEmpty()) {
+                row.addView(
+                    chip("译词", colors.accentText, colors.accent, onClick = {
+                        dismissActionPopup()
+                        commitCandidateText(en)
+                    })
+                )
+            }
+        }
+        // 逐词译词明细：这条候选切成了哪些词、各是什么意思
+        run {
+            val detail = TypesakeCore.glossDetail(word)
+            if (detail.isNotEmpty()) {
+                row.addView(
+                    chip("明细", colors.keyText, colors.key, onClick = {
+                        dismissActionPopup()
+                        showGlossDetail(word, detail)
+                    })
+                )
+            }
+        }
         row.addView(
             chip("置顶", colors.accentText, colors.accent, onClick = {
                 val p = popupPinyin
@@ -680,6 +887,158 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         actionPopup = null
     }
 
+    /** 逐词译词明细：这条候选切成的每一段（词 / 释义 / 词性 / 生词 / 级别）。 */
+    private fun showGlossDetail(word: String, detail: List<TypesakeCore.GlossWord>) {
+        dismissActionPopup()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colors.bg)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        box.addView(textLabel(word, colors.barText, colors.bg))
+        for (p in detail) {
+            val head = if (p.pos.isEmpty()) p.zh else "${p.zh} ${p.pos}"
+            val tail = buildString {
+                append(" — ")
+                append(p.en)
+                if (p.level.isNotEmpty()) append("  ${p.level}")
+                if (p.fresh) append("  ●")
+            }
+            box.addView(
+                textLabel(
+                    head + tail,
+                    if (p.fresh) colors.accent else colors.hint,
+                    colors.bg,
+                )
+            )
+        }
+        box.addView(chip("关闭", colors.keyText, colors.key) { dismissActionPopup() })
+        val popup =
+            PopupWindow(box, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
+                .apply { isOutsideTouchable = true }
+        val anchor = candidateRow
+        val loc = IntArray(2)
+        anchor.getLocationInWindow(loc)
+        popup.showAtLocation(anchor, Gravity.NO_GRAVITY, loc[0] + dp(8), loc[1] + dp(40))
+        actionPopup = popup
+    }
+
+    // ---------------- 快捷输入（v 算式 / i 中文数字 / im 金额 / u 码点） ----------------
+
+    /**
+     * 这一键要不要交给快捷输入。
+     *
+     * 关键取舍：**只有当形状真的被「确认」时才抢**——即拼音缓冲正好是一个
+     * `v` / `i` / `u` 前缀、而新来的这一键把它坐实成快捷输入的样子。
+     * 这样双拼里 `v`/`i`/`u`（zh/ch/sh 的开头）照常出候选，不被快捷输入拖住；
+     * 数字键如果本来有对应候选，也让位给「选词」。
+     */
+    private fun shortcutKey(text: String): Boolean {
+        if (text.isEmpty()) return false
+        if (privateField || englishMode) return false
+        if (scBuf.isNotEmpty()) {
+            val next = scBuf.toString() + text
+            if (shortcutShapeOk(next)) {
+                scBuf.append(text)
+                updateShortcut()
+                return true
+            }
+            // 形状断了：清缓冲，这一键回落到正常流程
+            exitShortcut()
+            return false
+        }
+        if (!prefs.shortcut || t9Mode || pinyin.length != 1) return false
+        val ch = text[0]
+        if (!entersShortcut(pinyin[0], ch)) return false
+        if (ch.isDigit()) {
+            val idx = if (ch == '0') 9 else ch.digitToInt() - 1
+            if ((match?.candidates ?: candidates).getOrNull(idx) != null) return false
+        }
+        scBuf.append(pinyin).append(ch)
+        pinyin.setLength(0)
+        candidates = emptyList()
+        match = null
+        allCandidates = emptyList()
+        pageStart = 0
+        selfEdit = true
+        currentInputConnection?.setComposingText(scBuf.toString(), 1)
+        updateShortcut()
+        return true
+    }
+
+    /** 第一键后缀能不能坐实快捷输入形状（`im` 单独在 onLetter 里放行）。 */
+    private fun entersShortcut(prefix: Char, next: Char): Boolean = when (prefix) {
+        'v' -> next.isDigit() || next == '(' || next == '-' || next == '.'
+        'i' -> next.isDigit() || next == '-' || next == '.'
+        'u' -> next.isDigit()
+        else -> false
+    }
+
+    /** 整条缓冲是否仍然是某个快捷输入的合法前缀；不是就退出、交还给拼音。 */
+    private fun shortcutShapeOk(s: String): Boolean {
+        if (s.isEmpty() || s[0] !in "viu") return false
+        val rest = s.substring(1)
+        if (rest.isEmpty()) return true
+        return when (s[0]) {
+            'v' -> rest.all { it.isDigit() || it in "()+-*/.^%" }
+            'u' -> rest.all { it.isLetterOrDigit() }
+            else -> if (s.startsWith("im")) s.substring(2).all { it.isDigit() || it == '.' }
+            else rest.all { it.isDigit() || it == '-' || it == '.' }
+        }
+    }
+
+    private fun updateShortcut() {
+        val hit = TypesakeCore.shortcutOf(scBuf.toString())
+        scKind = hit?.kind.orEmpty()
+        renderCandidates()
+    }
+
+    private fun exitShortcut() {
+        if (scBuf.isEmpty()) return
+        scBuf.setLength(0)
+        scKind = ""
+        currentInputConnection?.setComposingText("", 0)
+        renderCandidates()
+    }
+
+    /** 空格/回车/点候选：把算好的结果上屏。 */
+    private fun commitShortcut() {
+        val hit = TypesakeCore.shortcutOf(scBuf.toString()) ?: return
+        scBuf.setLength(0)
+        scKind = ""
+        candidates = emptyList()
+        match = null
+        val ic = currentInputConnection ?: return
+        ic.setComposingText("", 0)
+        ic.commitText(hit.text, 1)
+        selfEdit = true
+        digitRun.setLength(0)
+        renderCandidates()
+        renderEnglish()
+    }
+
+    /**
+     * 大千注音：这一键该当注音键进组合区，而不是选词/翻页/标点。
+     *
+     * 注音击键里含 `0-9`（ㄅㄉㄓ 与调号）和 `,` `.` `;` `/` `-`（ㄝㄡㄥㄤㄦ），
+     * 与选词键、翻页键、句号键撞车，只能按方案分流：
+     *
+     * - 数字永远是注音键（`-` 同理，因为它能独立成音「ㄦ」，丢了就没法打）；
+     * - `,` `.` `;` `/` 在**组合中**是注音键；没在组合时只认主键区
+     *   （主键区的 `.` 是句号键、这里当 ㄡ），符号页的 `，` `。` 仍是普通标点——
+     *   否则注音模式下一个逗号都打不出来。
+     */
+    private fun zhuyinInput(text: String): Boolean {
+        if (prefs.shuangpin != TypesakePrefs.SCHEME_ZHUYIN) return false
+        if (t9Mode || englishMode || privateField) return false
+        if (text.length != 1) return false
+        val ch = text[0]
+        if (ch.isDigit() || ch == '-') return true
+        if (ch !in ",.;:/") return false
+        if (pinyin.isNotEmpty()) return true
+        return layer == KbLayer.LETTERS
+    }
+
     // ---------------- 输入逻辑 ----------------
 
     override fun onInsert(text: String) {
@@ -691,11 +1050,31 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
         // 英文模式：字母直接上屏（不转拼音）
         if (englishMode && text.length == 1 && text[0].isLetter()) {
+            // 只有开了拼写纠正、且这个应用没被屏蔽英文时，才需要一个「未定稿」的词区
+            if (prefs.englishFix && !prefs.englishBlockedFor(currentPkg)) {
+                enBuf.append(text)
+                selfEdit = true
+                digitRun.setLength(0)
+                pageStart = 0
+                allCandidates = emptyList()
+                ic.setComposingText(enBuf.toString(), 1)
+                updateEnglishFix()
+                renderEnglish()
+                return
+            }
             ic.commitText(text, 1)
             digitRun.setLength(0)
             refreshBars()
             return
         }
+        // 大千注音：0-9 与 `,` `.` `;` `/` `-` 都是注音键，不是选词/翻页/标点。
+        // 必须排在快捷输入之前——`u`+数字 本来就是「ㄧ+注音」，会被快捷输入抢走。
+        if (zhuyinInput(text)) {
+            onLetter(text)
+            return
+        }
+        // 快捷输入：形状一旦坐实就接管（与拼音互不干扰）
+        if (shortcutKey(text)) return
         // 九键：数字/字母进缓冲
         if (t9Mode && text.length == 1 && text[0].isLetterOrDigit()) {
             t9buf.append(text.lowercase())
@@ -710,7 +1089,18 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         // 拼音输入中：数字键选候选
         if (pinyin.isNotEmpty() && text.length == 1 && text[0].isDigit()) {
             val idx = if (text == "0") 9 else text[0].digitToInt() - 1
-            (match?.candidates ?: candidates).getOrNull(idx)?.let {
+            val list = match?.candidates ?: candidates
+            // 数字键直出译词（一次性）：这条数字上屏的是该候选的英文释义
+            if (translateOut) {
+                list.getOrNull(idx)?.let { cand ->
+                    val en = TypesakeCore.shortGlossOf(cand)
+                    if (en.isNotEmpty()) {
+                        commitCandidateText(en)
+                        return
+                    }
+                }
+            }
+            list.getOrNull(idx)?.let {
                 commitCandidate(it)
                 return
             }
@@ -733,6 +1123,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             return
         }
 
+        // 英文模式拼写纠正：第一个非字母键（空格/数字/标点）= 词到头了，定稿上屏
+        if (enBuf.isNotEmpty()) commitEnglishWord()
         if (pinyin.isNotEmpty()) commitTopCandidate()
 
         if (text.length == 1) {
@@ -777,7 +1169,26 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     private fun onLetter(letterText: String) {
         val ic = currentInputConnection ?: return
-        pinyin.append(letterText.lowercase())
+        val lower = letterText.lowercase()
+        // 快捷输入 `im…`（中文大写金额）：只有全拼下才认——
+        // 双拼里 `i`+`m` 是正常击键，抢了会打断输入。
+        if (
+            lower == "m" && pinyin.toString() == "i" && prefs.shortcut &&
+            prefs.shuangpin == 0 && !englishMode && !t9Mode && !privateField
+        ) {
+            scBuf.append("im")
+            pinyin.setLength(0)
+            candidates = emptyList()
+            match = null
+            allCandidates = emptyList()
+            pageStart = 0
+            selfEdit = true
+            digitRun.setLength(0)
+            ic.setComposingText(scBuf.toString(), 1)
+            updateShortcut()
+            return
+        }
+        pinyin.append(lower)
         selfEdit = true
         digitRun.setLength(0)
         // 输入串变了，翻页状态必须归零，否则会显示上一串的候选页
@@ -832,6 +1243,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     private fun renderComposingEnglish(list: List<String>) {
         if (englishChips.isNotEmpty()) return
+        if (prefs.englishBlockedFor(currentPkg)) return
         val target = list.firstOrNull() ?: return
         val list = TypesakeCore.englishList(target)
         if (list.isNotEmpty()) {
@@ -859,6 +1271,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         allCandidates = emptyList()
         pinyin.setLength(0)
         t9buf.setLength(0)
+        scBuf.setLength(0)
+        scKind = ""
         candidates = emptyList()
         match = null
         lastCommittedChinese = word
@@ -867,6 +1281,27 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         }
         TypesakeCore.context(word)
         afterCommit(word)
+    }
+
+    /**
+     * 上屏一段任意文本（译词直出）：状态清理与 [`commitCandidate`] 一致，
+     * 但**不学习、不换上下文**——上屏的是英文，不该进中文的 bigram。
+     */
+    private fun commitCandidateText(text: String) {
+        val ic = currentInputConnection ?: return
+        ic.commitText(text, 1)
+        selfEdit = true
+        pageStart = 0
+        allCandidates = emptyList()
+        pinyin.setLength(0)
+        t9buf.setLength(0)
+        scBuf.setLength(0)
+        scKind = ""
+        candidates = emptyList()
+        match = null
+        digitRun.setLength(0)
+        translateOut = false
+        renderCandidates()
     }
 
     /** 原样上屏（不做纠错/不学习），并清空组合状态。 */
@@ -920,6 +1355,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     }
 
     private fun commitTopCandidate() {
+        if (scBuf.isNotEmpty()) {
+            commitShortcut()
+            return
+        }
         val top = (match?.candidates ?: candidates).firstOrNull() ?: pinyin.toString()
         if (pinyin.isNotEmpty()) commitCandidate(top)
     }
@@ -954,6 +1393,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     private fun insertEnglish(english: String) {
         val ic = currentInputConnection ?: return
+        if (enBuf.isNotEmpty()) commitEnglishWord()
         if (pinyin.isNotEmpty()) commitTopCandidate()
         ic.commitText(if (prefs.englishAutoSpace) "$english " else english, 1)
         digitRun.setLength(0)
@@ -978,6 +1418,13 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     override fun onSpace() {
         val ic = currentInputConnection ?: return
+        // 英文模式拼写纠正：空格 = 词到头了定稿（开着纠正时上屏的是纠正后的词）
+        if (englishMode && enBuf.isNotEmpty()) {
+            commitEnglishWord()
+            ic.commitText(" ", 1)
+            lastSpaceTap = 0L
+            return
+        }
         if (t9Mode && t9buf.isNotEmpty()) {
             commitTopCandidate()
             return
@@ -1003,6 +1450,16 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     override fun onEnter() {
         val ic = currentInputConnection ?: return
+        // 快捷输入：回车 = 上屏算好的结果
+        if (scBuf.isNotEmpty()) {
+            commitShortcut()
+            return
+        }
+        // 英文模式拼写纠正：回车 = 把当前词上屏（带纠正）
+        if (englishMode && enBuf.isNotEmpty()) {
+            commitEnglishWord()
+            return
+        }
         // 学商用输入法：回车 = 把输入串按英文原样上屏（不选中文候选）
         if (t9Mode && t9buf.isNotEmpty()) {
             commitRaw(t9buf.toString())
@@ -1025,6 +1482,36 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     override fun onBackspace() {
         val ic = currentInputConnection ?: return
+        // 快捷输入：退格先削快捷缓冲
+        if (scBuf.isNotEmpty()) {
+            scBuf.deleteCharAt(scBuf.length - 1)
+            selfEdit = true
+            if (scBuf.isEmpty()) {
+                scKind = ""
+                ic.setComposingText("", 0)
+                candidates = emptyList()
+                match = null
+                renderCandidates()
+            } else {
+                ic.setComposingText(scBuf.toString(), 1)
+                updateShortcut()
+            }
+            return
+        }
+        // 英文模式拼写纠正：退格先削当前词
+        if (englishMode && enBuf.isNotEmpty()) {
+            enBuf.deleteCharAt(enBuf.length - 1)
+            selfEdit = true
+            if (enBuf.isEmpty()) {
+                enFix = ""
+                ic.setComposingText("", 0)
+            } else {
+                ic.setComposingText(enBuf.toString(), 1)
+                updateEnglishFix()
+            }
+            renderEnglish()
+            return
+        }
         if (t9Mode && t9buf.isNotEmpty()) {
             t9buf.deleteCharAt(t9buf.length - 1)
             selfEdit = true
@@ -1070,6 +1557,12 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     /** 滑动删除：一次删掉光标前的一个词块。 */
     override fun onDeleteWord() {
         val ic = currentInputConnection ?: return
+        if (enBuf.isNotEmpty()) {
+            clearComposing()
+            ic.setComposingText("", 1)
+            renderEnglish()
+            return
+        }
         if (t9Mode && t9buf.isNotEmpty()) {
             t9buf.setLength(0)
             ic.setComposingText("", 1)
@@ -1146,6 +1639,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     override fun onCursorRight() = moveCursor(KeyEvent.KEYCODE_DPAD_RIGHT)
 
     override fun onToggleEnglish() {
+        // 切回中文前，先把英文模式里没定稿的词上屏，免得丢字
+        if (englishMode && enBuf.isNotEmpty()) commitEnglishWord()
         englishMode = !englishMode
         prefs.englishMode = englishMode
         if (englishMode && pinyin.isNotEmpty()) commitTopCandidate()

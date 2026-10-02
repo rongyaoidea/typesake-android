@@ -8,8 +8,8 @@
 //!
 //! 所有层都过"覆盖率闸门"：宁可不说，也不吐 `… …` 这类噪音。
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 候选来源（数值与 JNI 协议一致）。
 pub const KIND_MINE: u8 = 1;
@@ -799,6 +799,10 @@ pub fn load_dict(path: &str) -> usize {
             let mut m = big_dict().lock().unwrap_or_else(|e| e.into_inner());
             *m = map;
         }
+        // 词典换了，旧的译词缓存（可能是一片「查不到」）作废
+        crate::gloss::clear_cache();
+        // 拼写纠正用的英文词表同理作废
+        reset_en_words();
     }
     n
 }
@@ -813,6 +817,116 @@ fn dict_exact(zh: &str) -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .get(zh)
         .cloned()
+}
+
+/// 整词查大词典（逐词译词用）：命中返回英文释义原文（未加工）。
+pub(crate) fn dict_lookup(zh: &str) -> Option<String> {
+    dict_exact(zh)
+}
+
+// ---------------- 英文模式拼写纠正 ----------------
+
+/// 英文单词表的存储格（从大词典的英文侧收集；**首次用到才建**，不用的人不占这份内存）。
+///
+/// 放 `Arc` 是因为纠正在每次敲键都要查：锁只负责「第一次建表」，之后拿到的是共享句柄，
+/// 不用每敲一个字母就克隆 8 万条字符串。
+fn en_cell() -> &'static Mutex<Option<Arc<BTreeSet<String>>>> {
+    static W: OnceLock<Mutex<Option<Arc<BTreeSet<String>>>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(None))
+}
+
+/// 词典被换掉时作废旧词表（下次用到按新词典重建）。
+fn reset_en_words() {
+    *en_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 取英文词表；没有可取的（词典未载入）返回 `None`。
+fn en_words() -> Option<Arc<BTreeSet<String>>> {
+    let cell = en_cell();
+    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        let mut set = BTreeSet::new();
+        {
+            let m = big_dict().lock().unwrap_or_else(|e| e.into_inner());
+            for v in m.values() {
+                for tok in v.split(|c: char| !c.is_ascii_alphabetic()) {
+                    let t = tok.to_ascii_lowercase();
+                    if (2..=24).contains(&t.len()) {
+                        set.insert(t);
+                    }
+                }
+            }
+        }
+        *g = Some(Arc::new(set));
+    }
+    g.clone()
+}
+
+/// 有界编辑距离：距离超过 `max` 直接放弃（返回 `None`），省掉剩下的一大片 DP。
+fn edit_within(a: &[u8], b: &[u8], max: u8) -> Option<u8> {
+    let n = b.len();
+    let mut prev: Vec<u16> = (0..=n as u16).collect();
+    let mut cur = vec![0u16; n + 1];
+    for i in 1..=a.len() {
+        cur[0] = i as u16;
+        let mut row_min = cur[0];
+        for j in 1..=n {
+            let cost = u16::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        // 整行都超预算：后面无论怎么补都只会更贵
+        if row_min > u16::from(max) {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let d = prev[n] as u8;
+    (d <= max).then_some(d)
+}
+
+/// 英文模式拼写纠正：把打错的词换成词表里的真实词。
+///
+/// 判定很保守，宁可不纠正也不乱改：
+/// - 原词本身就在词表里（没打错）→ `None`；
+/// - 不是纯字母、或长度 <3 / >24 → `None`；
+/// - 编辑距离超限（≤4 字母只容 1 处，更长容 2 处）→ `None`；
+/// - 多个候选时依次比：**距离 → 首字母是否相同 → 长度差**，仍平手取字典序靠前的。
+///
+/// 返回的是小写词表形式；首字母大小写由调用方按原词还原。
+pub fn fix_spelling(word: &str) -> Option<String> {
+    let w = word.trim().to_ascii_lowercase();
+    if w.len() < 3 || w.len() > 24 || !w.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let set = en_words()?;
+    if set.is_empty() || set.contains(&w) {
+        return None;
+    }
+    let budget: u8 = if w.len() <= 4 { 1 } else { 2 };
+    let lo = w.len() - budget as usize;
+    let hi = w.len() + budget as usize;
+    let (ab, wb) = (w.as_bytes(), w.as_bytes());
+    let mut best: Option<((u8, u8, u8), String)> = None;
+    for cand in set.iter() {
+        let cl = cand.len();
+        if cl < lo || cl > hi {
+            continue;
+        }
+        let Some(d) = edit_within(wb, cand.as_bytes(), budget) else {
+            continue;
+        };
+        let key = (
+            d,
+            u8::from(cand.as_bytes()[0] != ab[0]),
+            cl.abs_diff(w.len()).min(255) as u8,
+        );
+        // 严格小于：BTreeSet 是字典序遍历，平手时自然留下字典序靠前的那个
+        if best.as_ref().map(|(bk, _)| key < *bk).unwrap_or(true) {
+            best = Some((key, cand.clone()));
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// 最长匹配（1..=6 字）。
@@ -1902,6 +2016,38 @@ mod tests {
         // 词典词参与组合：句子整体覆盖率足够时给出直译
         let en = suggest("我需要咖啡");
         assert!(en.to_lowercase().contains("coffee"), "got {en:?}");
+    }
+
+    #[test]
+    fn edit_within_respects_budget() {
+        assert_eq!(edit_within(b"cat", b"cat", 2), Some(0));
+        assert_eq!(edit_within(b"cat", b"cut", 2), Some(1));
+        assert_eq!(edit_within(b"cat", b"cats", 2), Some(1));
+        assert_eq!(edit_within(b"cofee", b"coffee", 2), Some(1));
+        // 超预算必须尽早放弃，而不是算完再说
+        assert_eq!(edit_within(b"cat", b"dog", 2), None);
+        assert_eq!(edit_within(b"kitten", b"sitting", 2), None);
+        assert_eq!(edit_within(b"", b"", 0), Some(0));
+    }
+
+    #[test]
+    fn fix_spelling_corrects_only_real_typos() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../app/src/main/assets/en_dict.tsv"
+        );
+        assert!(load_dict(path) > 50_000);
+        // 打对了：一个字都不该改
+        assert_eq!(fix_spelling("coffee"), None);
+        assert_eq!(fix_spelling("invoice"), None);
+        // 打错了：补回漏掉的字母
+        assert_eq!(fix_spelling("cofee").as_deref(), Some("coffee"));
+        assert_eq!(fix_spelling("restarant").as_deref(), Some("restaurant"));
+        // 不是词 / 不像词 / 夹杂非字母：宁可不纠正
+        assert_eq!(fix_spelling("ab"), None);
+        assert_eq!(fix_spelling("cof fee"), None);
+        assert_eq!(fix_spelling("asdfghjkl"), None);
+        assert_eq!(fix_spelling(""), None);
     }
 
     #[test]

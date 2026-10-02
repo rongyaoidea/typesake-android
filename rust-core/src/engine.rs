@@ -131,10 +131,7 @@ fn rerank_with_context(cands: &mut [String]) {
 
 /// 扩展候选（候选翻页用）：不走纠错，只要更多候选。
 pub fn more_candidates(input: &str, limit: usize) -> Vec<String> {
-    let compact = normalize(&shuangpin::to_full(
-        input,
-        SHUANGPIN.load(Ordering::Relaxed),
-    ));
+    let compact = canonical(input);
     if compact.is_empty() {
         return Vec::new();
     }
@@ -213,7 +210,7 @@ pub fn import_learned(items: Vec<(String, String, u32)>) {
 
 /// 记住一次纠错选择；同一 (错拼, 词) 多次选择会累计。
 pub fn remember(typed: &str, word: &str) {
-    let key = normalize(typed);
+    let key = canonical(typed);
     if key.is_empty() || word.is_empty() {
         return;
     }
@@ -304,6 +301,19 @@ pub fn normalize(input: &str) -> String {
         .filter(|c| c.is_ascii_alphabetic())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// 键盘击键 -> 引擎全拼：**先**按当前方案解码（双拼/注音还原成全拼，`x;` 这类
+/// 会用到 `;` 的方案必须先解码再规整，否则分号先被剥掉），**再**规整。
+///
+/// 只在「接收键盘击键」的入口调用一次；已经还原成全拼的中间结果
+/// （`candidates_with` 等）**绝不能**再过一遍——解码不是幂等的
+/// （例：小鹤下 `xue` 会被读成两个新键位），二次解码会把音节打散。
+pub fn canonical(input: &str) -> String {
+    normalize(&shuangpin::to_full(
+        input,
+        SHUANGPIN.load(Ordering::Relaxed),
+    ))
 }
 
 fn push_unique(out: &mut Vec<String>, word: String, limit: usize) {
@@ -525,7 +535,7 @@ pub fn candidates_with(eng: &PinyinEngine, input: &str, limit: usize) -> Vec<Str
 }
 
 pub fn candidates(input: &str, limit: usize) -> Vec<String> {
-    let compact = normalize(input);
+    let compact = canonical(input);
     if compact.is_empty() {
         return Vec::new();
     }
@@ -700,12 +710,11 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
 /// （即候选只能来自整句拼接/前缀补全）时，才尝试纠错兜底，从而避免把
 /// 正确输入误判成错拼。
 pub fn analyze(input: &str, limit: usize) -> Match {
-    let raw = normalize(input);
-    if raw.is_empty() {
+    // 击键先按方案解码成全拼（顺序不能反：`;` / 数字要先参与解码）
+    let compact = canonical(input);
+    if compact.is_empty() {
         return Match::default();
     }
-    // 双拼：先还原成全拼，再走既有流程（matched 返回全拼，宿主据此显示"击键→全拼"）
-    let compact = shuangpin::to_full(&raw, SHUANGPIN.load(Ordering::Relaxed));
     let eng = engine();
 
     let mut exact: Vec<String> = Vec::new();
@@ -854,7 +863,7 @@ pub fn predict_next(prev: &str, limit: usize) -> Vec<String> {
 
 /// 记录用户选词（3 连选自动 pin），返回该拼音的最新候选序。
 pub fn record_pick(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
-    let compact = normalize(pinyin);
+    let compact = canonical(pinyin);
     let word = word.trim();
     if compact.is_empty() || word.is_empty() {
         return Vec::new();
@@ -870,7 +879,7 @@ pub fn record_pick(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
 
 /// 置顶：把某个候选固定在该拼音的首位（用户主动 pin）。
 pub fn pin(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
-    let compact = normalize(pinyin);
+    let compact = canonical(pinyin);
     let word = word.trim();
     if compact.is_empty() || word.is_empty() {
         return Vec::new();
@@ -890,7 +899,7 @@ pub fn blocked_words() -> Vec<(String, String)> {
 
 /// 恢复某个被删掉的词（从黑名单移除）。
 pub fn unblock(pinyin: &str, word: &str) -> usize {
-    let (p, w) = (normalize(pinyin), word.trim().to_string());
+    let (p, w) = (canonical(pinyin), word.trim().to_string());
     let mut n = 0;
     {
         let mut b = blocked().lock().unwrap_or_else(|e| e.into_inner());
@@ -913,7 +922,7 @@ pub fn unblock(pinyin: &str, word: &str) -> usize {
 
 /// 删词：该拼音串下永久不再推荐这个词（并清掉它的置顶/学习记录）。
 pub fn forget(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
-    let compact = normalize(pinyin);
+    let compact = canonical(pinyin);
     let word = word.trim();
     if compact.is_empty() || word.is_empty() {
         return Vec::new();

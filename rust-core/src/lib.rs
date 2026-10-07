@@ -36,10 +36,12 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// 热路径列表分隔符（Unit Separator），比 JSON 便宜且无转义问题。
 pub const DELIM: char = '\u{1F}';
+/// `join` 的分隔符：预先建好，别在每次返回候选时都 `DELIM.to_string()` 分配一次。
+pub const DELIM_STR: &str = "\u{1F}";
 
 /// 把字符串列表拼成分隔串（空列表 -> 空串）。
 pub fn join_delim(items: &[String]) -> String {
-    items.join(&DELIM.to_string())
+    items.join(DELIM_STR)
 }
 
 /// 拆分分隔串（空串 -> 空列表）。

@@ -9,7 +9,7 @@
 //! 所有层都过"覆盖率闸门"：宁可不说，也不吐 `… …` 这类噪音。
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// 候选来源（数值与 JNI 协议一致）。
 pub const KIND_MINE: u8 = 1;
@@ -830,20 +830,26 @@ pub(crate) fn dict_lookup(zh: &str) -> Option<String> {
 ///
 /// 放 `Arc` 是因为纠正在每次敲键都要查：锁只负责「第一次建表」，之后拿到的是共享句柄，
 /// 不用每敲一个字母就克隆 8 万条字符串。
-fn en_cell() -> &'static Mutex<Option<Arc<BTreeSet<String>>>> {
-    static W: OnceLock<Mutex<Option<Arc<BTreeSet<String>>>>> = OnceLock::new();
-    W.get_or_init(|| Mutex::new(None))
+fn en_cell() -> &'static RwLock<Option<Arc<BTreeSet<String>>>> {
+    static W: OnceLock<RwLock<Option<Arc<BTreeSet<String>>>>> = OnceLock::new();
+    W.get_or_init(|| RwLock::new(None))
 }
 
 /// 词典被换掉时作废旧词表（下次用到按新词典重建）。
 fn reset_en_words() {
-    *en_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *en_cell().write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 取英文词表；没有可取的（词典未载入）返回 `None`。
 fn en_words() -> Option<Arc<BTreeSet<String>>> {
     let cell = en_cell();
-    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    // 快路径：只读锁拿到就返回（每敲一个字母都会走这里，原来每次都拿写锁）。
+    // 先把结果落到一个局部变量再判断，读锁在这一行结束就释放，不会和下面的写锁死锁。
+    let cached = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if cached.is_some() {
+        return cached;
+    }
+    let mut g = cell.write().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
         let mut set = BTreeSet::new();
         {
@@ -863,10 +869,15 @@ fn en_words() -> Option<Arc<BTreeSet<String>>> {
 }
 
 /// 有界编辑距离：距离超过 `max` 直接放弃（返回 `None`），省掉剩下的一大片 DP。
-fn edit_within(a: &[u8], b: &[u8], max: u8) -> Option<u8> {
+///
+/// 缓冲（`prev`/`cur`）由调用方持有并复用：纠错时每个长度合适的候选都要算一次距离，
+/// 原来每次都现分配两个 `Vec`，8 万词表下等于每敲一个字母几万次分配。
+fn edit_within(a: &[u8], b: &[u8], max: u8, prev: &mut Vec<u16>, cur: &mut Vec<u16>) -> Option<u8> {
     let n = b.len();
-    let mut prev: Vec<u16> = (0..=n as u16).collect();
-    let mut cur = vec![0u16; n + 1];
+    prev.clear();
+    prev.extend(0..=n as u16);
+    cur.clear();
+    cur.resize(n + 1, 0);
     for i in 1..=a.len() {
         cur[0] = i as u16;
         let mut row_min = cur[0];
@@ -907,13 +918,15 @@ pub fn fix_spelling(word: &str) -> Option<String> {
     let lo = w.len() - budget as usize;
     let hi = w.len() + budget as usize;
     let (ab, wb) = (w.as_bytes(), w.as_bytes());
+    let mut prev: Vec<u16> = Vec::new();
+    let mut cur: Vec<u16> = Vec::new();
     let mut best: Option<((u8, u8, u8), String)> = None;
     for cand in set.iter() {
         let cl = cand.len();
         if cl < lo || cl > hi {
             continue;
         }
-        let Some(d) = edit_within(wb, cand.as_bytes(), budget) else {
+        let Some(d) = edit_within(wb, cand.as_bytes(), budget, &mut prev, &mut cur) else {
             continue;
         };
         let key = (
@@ -929,13 +942,14 @@ pub fn fix_spelling(word: &str) -> Option<String> {
     best.map(|(_, c)| c)
 }
 
-/// 最长匹配（1..=6 字）。
-fn dict_longest(chars: &[char], start: usize) -> Option<(usize, String)> {
+/// 最长匹配（1..=6 字）。`buf` 由调用方复用，避免每个位置都现拼一个 `String`。
+fn dict_longest(chars: &[char], start: usize, buf: &mut String) -> Option<(usize, String)> {
     let max = (chars.len() - start).min(6);
     let map = big_dict().lock().unwrap_or_else(|e| e.into_inner());
     for len in (1..=max).rev() {
-        let seg: String = chars[start..start + len].iter().collect();
-        if let Some(v) = map.get(&seg) {
+        buf.clear();
+        buf.extend(chars[start..start + len].iter());
+        if let Some(v) = map.get(buf.as_str()) {
             return Some((len, v.to_string()));
         }
     }
@@ -1155,6 +1169,7 @@ fn gloss(text: &str) -> (usize, usize, Vec<String>) {
     let mut matched = 0usize;
     let mut unknown = 0usize;
     let mut parts: Vec<String> = Vec::new();
+    let mut seg = String::new();
     while i < chars.len() {
         // 多字词条优先（开会 / 开会时间），再退到单词
         if let Some((len, en)) = longest_match(&idx.phrases_by_first, &chars, i) {
@@ -1171,7 +1186,7 @@ fn gloss(text: &str) -> (usize, usize, Vec<String>) {
             i += len;
             continue;
         }
-        if let Some((len, en)) = dict_longest(&chars, i) {
+        if let Some((len, en)) = dict_longest(&chars, i, &mut seg) {
             parts.push(en);
             matched += len;
             i += len;
@@ -1487,6 +1502,8 @@ fn literal(text: &str) -> Option<String> {
     let mut unknown = 0usize;
     let mut clause: Option<String> = None;
     let mut need_to = false;
+    // 大词典探测用的复用缓冲（与循环里的 `seg` 分开，避免遮蔽）
+    let mut probe = String::new();
 
     while i < chars.len() {
         // 时间词优先识别
@@ -1588,7 +1605,7 @@ fn literal(text: &str) -> Option<String> {
             i += len;
             continue;
         }
-        if let Some((len, en)) = dict_longest(&chars, i) {
+        if let Some((len, en)) = dict_longest(&chars, i, &mut probe) {
             objects.push(en);
             matched += len;
             i += len;
@@ -2018,16 +2035,21 @@ mod tests {
         assert!(en.to_lowercase().contains("coffee"), "got {en:?}");
     }
 
+    /// 测试用包装：生产路径复用缓冲（见 [`fix_spelling`]），这里每次给全新的。
+    fn edit(a: &[u8], b: &[u8], max: u8) -> Option<u8> {
+        edit_within(a, b, max, &mut Vec::new(), &mut Vec::new())
+    }
+
     #[test]
     fn edit_within_respects_budget() {
-        assert_eq!(edit_within(b"cat", b"cat", 2), Some(0));
-        assert_eq!(edit_within(b"cat", b"cut", 2), Some(1));
-        assert_eq!(edit_within(b"cat", b"cats", 2), Some(1));
-        assert_eq!(edit_within(b"cofee", b"coffee", 2), Some(1));
+        assert_eq!(edit(b"cat", b"cat", 2), Some(0));
+        assert_eq!(edit(b"cat", b"cut", 2), Some(1));
+        assert_eq!(edit(b"cat", b"cats", 2), Some(1));
+        assert_eq!(edit(b"cofee", b"coffee", 2), Some(1));
         // 超预算必须尽早放弃，而不是算完再说
-        assert_eq!(edit_within(b"cat", b"dog", 2), None);
-        assert_eq!(edit_within(b"kitten", b"sitting", 2), None);
-        assert_eq!(edit_within(b"", b"", 0), Some(0));
+        assert_eq!(edit(b"cat", b"dog", 2), None);
+        assert_eq!(edit(b"kitten", b"sitting", 2), None);
+        assert_eq!(edit(b"", b"", 0), Some(0));
     }
 
     #[test]

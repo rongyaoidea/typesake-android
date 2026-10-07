@@ -116,6 +116,8 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
     var t9 by remember { mutableStateOf(prefs.t9Layout) }
     var trial by remember { mutableStateOf("") }
     var savedFlash by remember { mutableStateOf("") }
+    // 输入方案清单来自引擎（一次 JNI + 解析），别在每次重组里重跑
+    val schemes = remember(tick) { TypesakeCore.schemes() }
 
     Column(
         Modifier
@@ -352,7 +354,7 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
         }
         // 输入方案：清单来自引擎（`shuangpin::schemes()`），不在 UI 里写死
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            TypesakeCore.schemes().chunked(3).forEach { rowItems ->
+            schemes.chunked(3).forEach { rowItems ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     rowItems.forEach { s ->
                         if (shuangpin == s.id) {

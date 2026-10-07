@@ -186,29 +186,55 @@ fn store_guard() -> std::sync::MutexGuard<'static, Store> {
     store().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 锁内生成落盘快照（目录 + 序列化结构），不含任何 IO。
-fn snapshot(s: &Store) -> (String, Db) {
+/// store 自己那部分字段的拷贝（锁内做，不排序、不取引擎锁）。
+struct StoreFields {
+    saved: Vec<SavedPhrase>,
+    settings: Settings,
+    stats: Stats,
+    user_words: Vec<(String, String)>,
+    word_picks: HashMap<String, u32>,
+}
+
+fn store_fields(s: &Store) -> StoreFields {
+    StoreFields {
+        saved: s.saved.clone(),
+        settings: s.settings.clone(),
+        stats: s.stats.clone(),
+        user_words: s.user_words.clone(),
+        word_picks: s.word_picks.clone(),
+    }
+}
+
+/// 锁外拼落盘结构：取引擎的 L0/学习/黑名单，再把生词本排序。
+///
+/// 排序 4 万条 + 序列化都很贵，所以调用方应该先在锁内 `store_fields()`，
+/// 再 `drop` 锁后调它——`persist()` 就是这么做的。
+fn db_from(f: StoreFields) -> Db {
     let l0 = engine::export_l0();
     let corrections: Vec<Correction> = engine::export_learned()
         .into_iter()
         .map(|(typed, word, count)| Correction { typed, word, count })
         .collect();
-    let db = Db {
+    Db {
         version: 3,
-        saved: s.saved.clone(),
+        saved: f.saved,
         l0: L0File {
             pins: l0.pins,
             pick_counts: l0.pick_counts,
         },
-        settings: s.settings.clone(),
-        stats: s.stats.clone(),
+        settings: f.settings,
+        stats: f.stats,
         corrections,
         blocked: engine::export_blocked(),
-        user_words: s.user_words.clone(),
+        user_words: f.user_words,
         mail_domains: userdic::domains_snapshot(),
-        word_picks: word_picks_sorted(&s.word_picks),
-    };
-    (s.dir.clone(), db)
+        word_picks: word_picks_sorted(&f.word_picks),
+    }
+}
+
+/// 锁内生成落盘快照（目录 + 序列化结构），不含任何 IO。
+fn snapshot(s: &Store) -> (String, Db) {
+    (s.dir.clone(), db_from(store_fields(s)))
 }
 
 /// 在锁外落盘（含 fsync）。调用方必须先 `drop` 锁再调用，
@@ -529,30 +555,33 @@ pub fn user_words() -> Vec<(String, String)> {
 }
 
 /// 命中给定拼音（精确或前缀）的姓名，最多 limit 条。
+///
+/// 每键都会被 `engine::analyze` 问一次，所以两趟都必须能提前收手：精确命中够 limit
+/// 就别再扫前缀（原来的精确那一趟根本没有 break，能白扫 2000 条）。
 pub fn user_words_for(pinyin: &str, limit: usize) -> Vec<String> {
     let key = pinyin.trim().to_ascii_lowercase();
-    if key.is_empty() {
+    if key.is_empty() || limit == 0 {
         return Vec::new();
     }
     let s = store_guard();
     let mut out: Vec<String> = Vec::new();
-    for (py, word) in s.user_words.iter().filter(|(py, _)| py == &key) {
-        let _ = py;
+    for (_py, word) in s.user_words.iter().filter(|(py, _)| py == &key) {
         if !out.contains(word) {
             out.push(word.clone());
+            if out.len() >= limit {
+                return out;
+            }
         }
     }
-    if out.len() < limit {
-        for (_py, word) in s
-            .user_words
-            .iter()
-            .filter(|(py, _)| py.starts_with(&key) && py != &key)
-        {
-            if !out.contains(word) {
-                out.push(word.clone());
-                if out.len() >= limit {
-                    break;
-                }
+    for (_py, word) in s
+        .user_words
+        .iter()
+        .filter(|(py, _)| py.starts_with(&key) && py != &key)
+    {
+        if !out.contains(word) {
+            out.push(word.clone());
+            if out.len() >= limit {
+                break;
             }
         }
     }
@@ -622,13 +651,16 @@ pub fn import_json(text: &str) -> Result<(usize, usize), String> {
 
 /// 学习/设置数据落盘（选词、纠错记忆、收尾 flush 时调用）。锁外写盘。
 pub fn persist() -> Result<(), String> {
-    let s = store_guard();
-    if s.dir.is_empty() {
-        return Ok(());
-    }
-    let snap = snapshot(&s);
-    drop(s);
-    write_snapshot(&snap)
+    // 锁内只拷字段，锁外再排序/取引擎/序列化：生词本最多 4 万条，
+    // 拿着全局 store 锁做这些事会把每次上屏都变成一个串行点。
+    let (dir, fields) = {
+        let s = store_guard();
+        if s.dir.is_empty() {
+            return Ok(());
+        }
+        (s.dir.clone(), store_fields(&s))
+    };
+    write_snapshot(&(dir, db_from(fields)))
 }
 
 #[cfg(test)]
@@ -788,5 +820,22 @@ mod tests {
         let (n, _) = init(&dir).unwrap();
         assert_eq!(n, 0);
         assert_eq!(stats().words, 0);
+    }
+
+    #[test]
+    fn user_words_for_respects_limit_on_exact_hits() {
+        let _g = lock();
+        let dir = tmp_dir("names");
+        init(&dir).unwrap();
+        clear_user_words();
+        // 多个姓名（zhangsan / lisi / wangwu / zhaoliu），查 "zhang" 时只该给 limit 条
+        import_names("张三\n李四\n王五\n赵六").unwrap();
+        let two = user_words_for("zhang", 2);
+        assert!(two.len() <= 2, "got {two:?}");
+        assert!(two.contains(&"张三".to_string()), "got {two:?}");
+        // limit=0 直接空，别白扫
+        assert!(user_words_for("zhang", 0).is_empty());
+        assert!(user_words_for("", 2).is_empty());
+        clear_user_words();
     }
 }

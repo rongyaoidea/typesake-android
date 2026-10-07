@@ -86,16 +86,22 @@ class KeyboardView(
 
     // ---------------- 对外 API ----------------
 
+    /**
+     * 重绘键盘。
+     *
+     * 参数一律不给默认值：漏传 `customSymbols` / `englishMode` / `hideNumberRow` 会静默
+     * 把用户设置重置掉（之前进出符号页就会丢自定义符号）。
+     */
     fun render(
         kind: KbKind,
         layer: KbLayer,
         colors: KbColors,
         keyHeightDp: Int,
-        clipboardItems: List<String> = clipItems,
-        phrases: List<Pair<String, String>> = clipPhrases,
-        customSymbols: String = "",
-        englishMode: Boolean = false,
-        hideNumberRow: Boolean = false,
+        clipboardItems: List<String>,
+        phrases: List<Pair<String, String>>,
+        customSymbols: String,
+        englishMode: Boolean,
+        hideNumberRow: Boolean,
     ) {
         this.kind = kind
         this.englishMode = englishMode
@@ -124,13 +130,33 @@ class KeyboardView(
         }
     }
 
+    /**
+     * 大小写切换：只改字母键的字，不重建整块键盘。
+     *
+     * 重建一次要 new ~40 个 KeyButton，每个还带两个 GradientDrawable + StateListDrawable，
+     * 而大小写切换是「每按一个带 Shift 的字母都会走一次」的高频路径。
+     */
     fun setShift(shifted: Boolean, capsLock: Boolean) {
         if (this.shifted == shifted && this.capsLock == capsLock) return
         this.shifted = shifted
         this.capsLock = capsLock
-        if (layer == KbLayer.LETTERS) {
-            rows.removeAllViews()
-            buildKeys()
+        if (layer != KbLayer.LETTERS) return
+        val upper = shifted || capsLock
+        val shiftLabel = if (capsLock) "⇪" else "⇧"
+        for (i in 0 until rows.childCount) {
+            val row = rows.getChildAt(i) as? ViewGroup ?: continue
+            for (j in 0 until row.childCount) {
+                val key = row.getChildAt(j) as? KeyButton ?: continue
+                val id = key.key.id
+                val lower = id.removePrefix(KEY_PREFIX_LETTER)
+                when {
+                    // 字母键：大小写改写（id 恒为小写，取回小写字母再按当前状态写回）
+                    id.startsWith(KEY_PREFIX_LETTER) && lower.length == 1 && lower[0].isLetter() ->
+                        key.setLetter(if (upper) lower.uppercaseChar() else lower.lowercaseChar())
+                    // Shift 键自己也要换字面（⇧ / ⇪）
+                    id == KEY_ID_SHIFT -> key.setLabel(shiftLabel)
+                }
+            }
         }
     }
 
@@ -375,10 +401,10 @@ class KeyboardView(
 
     // ---------------- 按键 ----------------
 
-    private inner class KeyButton(val key: KbKey) : TextView(context) {
+    private inner class KeyButton(var key: KbKey) : TextView(context) {
 
         init {
-            text = key.label
+            text = swipeHint(key.label)
             gravity = Gravity.CENTER
             maxLines = 1
             isClickable = true
@@ -398,23 +424,47 @@ class KeyboardView(
                 addState(intArrayOf(), idle)
             }
             setPadding(dp(2), 0, dp(2), 0)
-            // 学百度：键面右上角用浅色小字提示"上滑符号"，解决"不知道有这功能"
-            val swipeSym = KbLayouts.swipeUpFor(key.label)
-            if (swipeSym != null && key.action is KbAction.Insert && key.label.length == 1) {
-                val sp = android.text.SpannableString("${key.label} $swipeSym")
-                val start = sp.length - swipeSym.length
-                sp.setSpan(
-                    android.text.style.RelativeSizeSpan(0.62f),
-                    start, sp.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
-                )
-                sp.setSpan(
-                    android.text.style.ForegroundColorSpan(colors.hint),
-                    start, sp.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
-                )
-                text = sp
-            }
+            setContentDescription(key.label)
             setOnTouchListener { v, e -> handleTouch(this, e) }
         }
+
+        /**
+         * 大小写原地改写（见 [setShift]）：只换字面与插入文本，不重建键帽。
+         *
+         * 字母键的 id 恒为小写（`letter_a`），所以从 id 取小写字母、再按当前大小写写回。
+         */
+        fun setLetter(ch: Char) {
+            val lower = key.id.removePrefix(KEY_PREFIX_LETTER)
+            if (lower.length != 1 || !lower[0].isLetter()) return
+            val label = ch.toString()
+            key = key.copy(label = label, action = KbAction.Insert(label))
+            text = swipeHint(label)
+            contentDescription = label
+        }
+
+        /** 只换字面（Shift 键 ⇧/⇪ 这类动作键用，行为不变）。 */
+        fun setLabel(label: String) {
+            key = key.copy(label = label)
+            text = label
+            contentDescription = label
+        }
+    }
+
+    /** 学百度：键面右上角用浅色小字提示"上滑符号"，解决"不知道有这功能"。 */
+    private fun swipeHint(label: String): CharSequence {
+        val swipeSym = KbLayouts.swipeUpFor(label)
+        if (swipeSym == null || label.length != 1) return label
+        val sp = android.text.SpannableString("$label $swipeSym")
+        val start = sp.length - swipeSym.length
+        sp.setSpan(
+            android.text.style.RelativeSizeSpan(0.62f),
+            start, sp.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        sp.setSpan(
+            android.text.style.ForegroundColorSpan(colors.hint),
+            start, sp.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        return sp
     }
 
     private fun handleTouch(v: View, e: MotionEvent): Boolean {
@@ -494,11 +544,13 @@ class KeyboardView(
         e.x >= 0 && e.y >= 0 && e.x <= v.width && e.y <= v.height
 
     private fun feedback(v: View) {
-        when (prefs.hapticLevel) {
-            0 -> Unit
-            1 -> v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            2 -> v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-            else -> v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (prefs.haptics) {
+            when (prefs.hapticLevel) {
+                0 -> Unit
+                1 -> v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                2 -> v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                else -> v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            }
         }
         if (prefs.sound) v.playSoundEffect(SoundEffectConstants.CLICK)
     }
@@ -670,5 +722,10 @@ class KeyboardView(
         const val PREVIEW_TIMEOUT_MS = 600L
         const val SWIPE_THRESHOLD = 60f
         const val SWIPE_THRESHOLD_ORTHO = 90f
+
+        /** 字母键 id 前缀（`letter_a`），大小写原地改写靠它取回小写字母 */
+        const val KEY_PREFIX_LETTER = "letter_"
+        /** Shift 键 id（字面 ⇧ / ⇪ 也要跟着状态换） */
+        const val KEY_ID_SHIFT = "shift"
     }
 }

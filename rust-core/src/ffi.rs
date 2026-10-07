@@ -48,7 +48,7 @@ fn err_json(e: &str) -> String {
 }
 
 fn join(items: &[String]) -> String {
-    items.join(&ITEM.to_string())
+    items.join(crate::DELIM_STR)
 }
 
 /// 候选分析：flag(0=直接 1=纠错 2=纠错记忆) + matched + 候选列表。
@@ -678,7 +678,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_glossBatch<'local>(
                 None => String::new(),
             })
             .collect();
-        groups.join(&ITEM.to_string())
+        groups.join(crate::DELIM_STR)
     });
     rust_to_jstr(&mut env, &out)
 }

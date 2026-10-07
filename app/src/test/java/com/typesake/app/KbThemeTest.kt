@@ -71,4 +71,43 @@ class KbThemeTest {
         assertEquals(KbPalette.OCEAN, KbThemes.paletteOf(4))
         assertEquals(KbPalette.CORAL, KbThemes.paletteOf(-1))
     }
+
+    @Test
+    fun contrastRatioMatchesKnownValues() {
+        // 黑底白字 21:1、白底黑字 21:1、同色 1:1
+        assertEquals(21.0, KbThemes.contrastRatio(0xFF000000.toInt(), 0xFFFFFFFF.toInt()), 0.05)
+        assertEquals(1.0, KbThemes.contrastRatio(0xFF123456.toInt(), 0xFF123456.toInt()), 0.001)
+        // 半透明只取 RGB：0x80000000 与纯黑等价
+        assertEquals(
+            21.0,
+            KbThemes.contrastRatio(0xFFFFFFFF.toInt(), 0x80000000.toInt()),
+            0.05,
+        )
+    }
+
+    /**
+     * 所有皮肤的「文字写在面板上」都必须过 4.5:1。
+     *
+     * 这条以前没有断言，于是默认皮肤里 `hint(#B0AEA5)` 写在浅灰键帽上只有 1.78:1
+     * ——「更多/下页/上页」这些按钮等于看不见，CI 也发现不了。
+     */
+    @Test
+    fun everyPaletteKeepsTextReadable() {
+        for (palette in KbPalette.entries) {
+            for (dark in listOf(false, true)) {
+                val c = KbThemes.resolve(palette, if (dark) KbThemes.THEME_DARK else KbThemes.THEME_LIGHT, dark)
+                val where = "${palette.name}/${if (dark) "dark" else "light"}"
+                fun check(label: String, fg: Int, bg: Int) {
+                    val r = KbThemes.contrastRatio(fg, bg)
+                    assertTrue("$where $label contrast=$r", r >= 4.5)
+                }
+                check("keyText/key", c.keyText, c.key)
+                check("actionText/actionKey", c.actionText, c.actionKey)
+                check("hint/key", c.hint, c.key)
+                check("hint/barBg", c.hint, c.barBg)
+                check("barText/barBg", c.barText, c.barBg)
+                check("accentText/accent", c.accentText, c.accent)
+            }
+        }
+    }
 }

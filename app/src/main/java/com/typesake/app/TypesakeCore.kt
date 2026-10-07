@@ -207,6 +207,13 @@ object TypesakeCore {
         }
         return runCatching { parseMatch(analyzeInput(pinyin), pinyin) }
             .getOrDefault(Match(pinyin, false, false, fallbackCandidates(pinyin)))
+            .also {
+                // 每键都走这里，必须把结果喂进 LRU：否则热路径的 cached() 永远 miss，
+                // 候选条会先闪一下空列表再被协程填上（选词/置顶/删词也会顺手刷新这条缓存）
+                if (it.candidates.isNotEmpty()) {
+                    synchronized(cache) { cache[pinyin] = it.candidates }
+                }
+            }
     }
 
     fun candidates(pinyin: String): List<String> =

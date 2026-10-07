@@ -111,13 +111,15 @@ pub fn candidates(digits: &str, limit: usize) -> Vec<String> {
         if exp.is_empty() {
             continue;
         }
-        let exact = engine::lookup_cheap(eng, &exp, 1);
-        for w in engine::lookup_cheap(eng, &exp, 2) {
-            if scored.iter().any(|(_, _, x)| x == &w) {
+        // 一次查 2 条就够判「精确命中」：`lookup_cheap` 先做精确查找，精确结果排在第 0 位，
+        // 原来为了拿这个排序额外查一遍 limit=1，每个展开拼音都白跑一次 FST
+        let hits = engine::lookup_cheap(eng, &exp, 2);
+        for w in &hits {
+            if scored.iter().any(|(_, _, x)| x == w) {
                 continue;
             }
-            let rank = if exact.first() == Some(&w) { 0u8 } else { 1u8 };
-            scored.push((rank, i, w));
+            let rank = if hits.first() == Some(w) { 0u8 } else { 1u8 };
+            scored.push((rank, i, w.clone()));
             if scored.len() >= limit * 4 {
                 break;
             }

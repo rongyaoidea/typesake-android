@@ -111,6 +111,8 @@ object TextUtils {
     )
 
     private val MIXED_TOKEN = Regex("(\\d+)([a-z]+)?")
+    private val AT_DOMAIN = Regex("@([a-z0-9.]{1,})$")
+    private val HOST_DOT = Regex("([a-z0-9-]{2,})\\.$")
 
     /**
      * 数字/日期混合识别：`2013nian10yue1ri` → 2013年10月1日；`3dian8fen` → 3点8分。
@@ -145,7 +147,7 @@ object TextUtils {
         textBefore: String,
         learned: List<String> = emptyList(),
     ): List<Pair<String, String>> {
-        val m = Regex("@([a-z0-9.]{1,})$").find(textBefore.lowercase()) ?: return emptyList()
+        val m = AT_DOMAIN.find(textBefore.lowercase()) ?: return emptyList()
         val typed = m.groupValues[1]
         val out = mutableListOf<Pair<String, String>>()
         val pool = learned + listOf("gmail.com", "outlook.com", "qq.com", "163.com", "foxmail.com")
@@ -160,7 +162,7 @@ object TextUtils {
 
     /** 网址后缀联想：文本以 `单词.` 结尾时给出常见域名后缀。 */
     fun domainSuffixCandidates(textBefore: String): List<Pair<String, String>> {
-        val m = Regex("([a-z0-9-]{2,})\\.$").find(textBefore.lowercase()) ?: return emptyList()
+        val m = HOST_DOT.find(textBefore.lowercase()) ?: return emptyList()
         return listOf("com", "cn", "com.cn", "org", "net", "io").take(3).map { it to it }
     }
 

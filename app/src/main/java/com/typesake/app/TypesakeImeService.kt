@@ -22,6 +22,7 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.typesake.app.kb.KbColors
@@ -58,6 +59,9 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private lateinit var keyboard: KeyboardView
     private lateinit var candidateRow: LinearLayout
     private lateinit var englishRow: LinearLayout
+    /** 候选条外层：竖向滚动。竖排候选比一屏高时靠它把末尾的「更多」滚进来 */
+    private lateinit var candidatePane: ScrollView
+    /** 候选条内层：横向滚动 */
     private lateinit var candidateScroll: HorizontalScrollView
     private lateinit var englishScroll: HorizontalScrollView
 
@@ -103,6 +107,19 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     /** 快捷输入的分类标签（算式/中文数字/金额/字符），空 = 还没算出来 */
     private var scKind = ""
 
+    /**
+     * 已下发给引擎的选项指纹。
+     *
+     * Rust 的 `set_settings` 会写快照文件并重载简繁表，既不能放主线程，也不该每次
+     * 聚焦输入框都重复跑一遍；指纹不变就跳过。
+     */
+    @Volatile
+    private var appliedOptions = ""
+
+    /** 行内译词缓存：key=候选词，value=没有可靠释义时是 null（null 也要缓存住） */
+    private val glossCache = HashMap<String, TypesakeCore.GlossLine?>()
+    private var lastVertical = false
+
     /** 数字键直出译词：开着时按数字键上屏的是英文释义而不是中文候选 */
     private var translateOut = false
 
@@ -122,12 +139,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
             if (::keyboard.isInitialized) {
                 colors = resolveColors()
-                keyboard.render(
-                    kind, layer, colors, prefs.keyHeightDp, clipItems.toList(),
-                    pairList(), prefs.customSymbols, englishMode, prefs.hideNumberRow,
-                )
+                renderKeyboard()
                 refreshBars()
             }
+            syncEngineOptions()
         }
 
     private var actionPopup: PopupWindow? = null
@@ -144,15 +159,41 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         io.launch {
             TypesakeAssets.ensureEnglishDict(this@TypesakeImeService)
             TypesakeCore.init(filesDir.absolutePath)
-            TypesakeCore.setOptions(prefs.fuzzy, prefs.correction, prefs.shuangpin)
+            // 引擎侧选项：Rust 会写快照 + 重载简繁表，必须在 IO 线程
+            TypesakeCore.setOptions(prefs.fuzzy, prefs.correction, prefs.shuangpin, prefs.script)
+            appliedOptions = engineOptionsKey()
             withContext(Dispatchers.Main) {
                 engineReady = true
                 if (::keyboard.isInitialized) {
-                    keyboard.render(kind, layer, colors, prefs.keyHeightDp, clipItems.toList(), pairList())
+                    renderKeyboard()
                     refreshBars()
                 }
             }
         }
+    }
+
+    /** 已下发给引擎的选项指纹。 */
+    private fun engineOptionsKey(): String =
+        "${prefs.fuzzy}|${prefs.correction}|${prefs.shuangpin}|${prefs.script}"
+
+    /** 选项变了才重新下发（漏传 script 会把「输出繁体」在引擎侧冲回简体）。 */
+    private fun syncEngineOptions() {
+        if (!engineReady) return
+        val want = engineOptionsKey()
+        if (want == appliedOptions) return
+        appliedOptions = want
+        io.launch {
+            TypesakeCore.setOptions(prefs.fuzzy, prefs.correction, prefs.shuangpin, prefs.script)
+        }
+    }
+
+    /** 键盘重绘的唯一入口：参数必须齐全，漏传会静默重置自定义符号/中英状态/数字行。 */
+    private fun renderKeyboard() {
+        if (!::keyboard.isInitialized) return
+        keyboard.render(
+            kind, layer, colors, prefs.keyHeightDp, clipItems.toList(),
+            pairList(), prefs.customSymbols, englishMode, prefs.hideNumberRow,
+        )
     }
 
     override fun onDestroy() {
@@ -170,10 +211,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         colors = resolveColors()
         applyGlassBlur()
         if (::keyboard.isInitialized) {
-            keyboard.render(
-                kind, layer, colors, prefs.keyHeightDp, clipItems.toList(),
-                pairList(), prefs.customSymbols, englishMode, prefs.hideNumberRow,
-            )
+            renderKeyboard()
             refreshBars()
         }
     }
@@ -211,9 +249,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        if (engineReady) {
-            TypesakeCore.setOptions(prefs.fuzzy, prefs.correction, prefs.shuangpin)
-        }
+        syncEngineOptions()
         val startInputType = info?.inputType ?: currentInputEditorInfo?.inputType ?: 0
         englishMode = if (KbLayouts.learningDisabled(startInputType)) {
             false
@@ -229,20 +265,38 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         englishChips = emptyList()
         shifted = false
         capsLock = false
+        selfEdit = false
+        lastSpaceTap = 0L
         colors = resolveColors()
-        phrases = loadPhrases()
+        // 收藏语读一次就够（JNI + JSON 全量解码，别放主线程）
+        loadPhrasesAsync()
         if (::keyboard.isInitialized) {
-            pageStart = 0
-        allCandidates = emptyList()
-        keyboard.setOneHand(OneHand.fromInt(prefs.oneHand))
-            keyboard.render(
-                kind, layer, colors, prefs.keyHeightDp, clipItems.toList(),
-                pairList(), prefs.customSymbols, englishMode, prefs.hideNumberRow,
-            )
+            resetPaging()
+            keyboard.setOneHand(OneHand.fromInt(prefs.oneHand))
+            renderKeyboard()
             keyboard.setShift(false, false)
             refreshBars()
         }
         registerClipboard()
+    }
+
+    /**
+     * 收藏语（键盘常用语页）异步载入。
+     *
+     * `loadPhrases()` 是一次 JNI + kotlinx JSON 全量解码，之前每次聚焦输入框都在主线程跑；
+     * 载入完再补一次渲染即可（键盘此时通常已经画好了）。
+     */
+    private fun loadPhrasesAsync() {
+        io.launch {
+            val loaded = loadPhrases()
+            withContext(Dispatchers.Main) {
+                phrases = loaded
+                if (::keyboard.isInitialized) {
+                    renderKeyboard()
+                    refreshBars()
+                }
+            }
+        }
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
@@ -254,6 +308,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     }
 
     override fun onWindowHidden() {
+        lookupJob?.cancel()
+        // 候选弹层（更多/置顶/译词明细）挂在输入法窗口上，窗口不可见时必须收掉，
+        // 否则切换窗口后会留一个点不动的浮层
+        dismissActionPopup()
         if (::keyboard.isInitialized) keyboard.dismissAllPopups()
         super.onWindowHidden()
     }
@@ -270,12 +328,16 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         root = FrameLayout(this)
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // 中文候选在上
-        candidateScroll = HorizontalScrollView(this)
+        // 中文候选在上：外层竖向滚动 + 内层横向滚动。
+        // 横排只有一行，外层不滚；竖排是一列，内容比一屏高时外层负责上下滚，
+        // 否则「更多 / 下页 / 上页」这些末尾按钮会被固定高度的候选条裁掉，根本点不到。
+        candidatePane = ScrollView(this).apply { isFillViewport = true }
+        candidateScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         candidateRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         candidateScroll.addView(candidateRow)
+        candidatePane.addView(candidateScroll)
         column.addView(
-            candidateScroll,
+            candidatePane,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(CAND_BAR_DP))
         )
 
@@ -332,9 +394,25 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         candidates = emptyList()
         match = null
         lastCommittedChinese = ""
+        digitRun.setLength(0)
+        // 「数字键直出译词」是逐次输入的临时状态：换输入框必须复位，
+        // 否则下一个输入框里按数字键会莫名其妙上屏英文释义
+        translateOut = false
+        resetPaging()
+    }
+
+    /** 翻页状态复位：所有「清空候选」的路径都必须走这里，否则会显示上一串输入的候选页。 */
+    private fun resetPaging() {
         pageStart = 0
         allCandidates = emptyList()
     }
+
+    /** 已记邮箱域名（JNI）：只有用户点了某个域名之后才变，缓存住，别每次渲染都问引擎。 */
+    private var mailDomainsCache: List<String>? = null
+
+    private fun mailDomains(): List<String> =
+        mailDomainsCache
+            ?: TypesakeCore.learnedMailDomains().also { mailDomainsCache = it }
 
     private fun refreshBars() {
         renderCandidates()
@@ -344,10 +422,18 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private fun renderCandidates() {
         if (!::candidateRow.isInitialized) return
         candidateRow.removeAllViews()
-        applyBarBackground(candidateScroll)
+        applyBarBackground(candidatePane)
         composingInfo = ""   // 每帧重置，避免纠错提示残留
         val vertical = prefs.verticalCandidates
         candidateRow.orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        // 竖排一屏 4 条（+「更多/翻页」按钮），条得比横排高，否则末尾按钮全被裁掉。
+        // 只有朝向真变了才改高度：每次渲染都重设 LayoutParams 会让整个输入法窗口重新布局
+        if (vertical != lastVertical) {
+            lastVertical = vertical
+            candidatePane.layoutParams = candidatePane.layoutParams.apply {
+                height = dp(if (vertical) CAND_BAR_VERTICAL_DP else CAND_BAR_DP)
+            }
+        }
 
         // 0) 九键输入中
         if (t9Mode && t9buf.isNotEmpty()) {
@@ -405,14 +491,14 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             }
             val full = m?.candidates ?: candidates
             val paged = prefs.pageKeys == 1
-            val perPage = if (vertical) 4 else 8
+            val perPage = CandidateBar.perPage(vertical)
             if (paged) {
                 allCandidates = if (allCandidates.isEmpty() || pageStart == 0) full else allCandidates
             }
             val list = if (paged) {
                 allCandidates.drop(pageStart).take(perPage)
             } else {
-                full.take(if (vertical) 4 else 8)
+                full.take(perPage)
             }
             if (list.isEmpty()) {
                 val hint = if (!TypesakeCore.available) {
@@ -424,9 +510,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 }
                 candidateRow.addView(textLabel(hint, colors.hint, colors.barBg))
             } else {
-                // 候选旁逐词译词：一次 JNI 取回整页，查不到释义的位置是 null
-                val glosses =
-                    if (prefs.gloss) TypesakeCore.glossLines(list) else list.map { null }
+                // 候选旁逐词译词：只读缓存，JNI 在 cpu 线程预取（主线程不做跨 FFI 的批量查询）
+                val glosses = cachedGloss(list)
                 for ((i, word) in list.withIndex()) {
                     candidateRow.addView(
                         candidateChip(
@@ -441,7 +526,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                     candidateRow.addView(
                         chip(
                             if (translateOut) "译●" else "译",
-                            if (translateOut) colors.accentText else colors.hint,
+                            if (translateOut) colors.accentText else colors.keyText,
                             if (translateOut) colors.accent else colors.key,
                         ) {
                             translateOut = !translateOut
@@ -451,16 +536,16 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 }
             }
             if (paged && allCandidates.size > pageStart + perPage) {
-                candidateRow.addView(chip("下页 ▸", colors.hint, colors.key) { flipPage(1) })
+                candidateRow.addView(chip("下页 ▸", colors.keyText, colors.key) { flipPage(1) })
             }
             if (paged && pageStart > 0) {
-                candidateRow.addView(chip("◂ 上页", colors.hint, colors.key) { flipPage(-1) })
+                candidateRow.addView(chip("◂ 上页", colors.keyText, colors.key) { flipPage(-1) })
             }
             // A3 误纠错一键还原：把原样输入也作为候选
             if (m != null && m.corrected) {
                 val raw = pinyin.toString()
                 if (raw.isNotEmpty() && !list.contains(raw)) {
-                    candidateRow.addView(chip("原样 $raw", colors.hint, colors.key) { commitRaw(raw) })
+                    candidateRow.addView(chip("原样 $raw", colors.keyText, colors.key) { commitRaw(raw) })
                 }
             }
             // #5 超长保护：拼音串过长时提示可直接回车上屏（不阻塞候选）
@@ -469,10 +554,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                     chip("过长 · 回车直接上屏", colors.accentText, colors.accent) { commitRaw(pinyin.toString()) }
                 )
             }
-            // B5：候选多于可见数时始终给"更多"入口（提升可发现性）
-            val perPageNow = if (vertical) 4 else 8
-            if (paged || full.size > perPageNow || list.size >= perPageNow) {
-                candidateRow.addView(chip("更多 ▸", colors.hint, colors.key) { showMoreCandidates() })
+            // B5：候选条被一屏占满时给「更多」入口；翻页模式一次已取满 24 条，用「下页/上页」就够，
+            // 再挂弹层只会把同一批词重列一遍（旧判断 full.size > perPage 恒为假，等于死代码）
+            if (CandidateBar.showMore(list.size, vertical, paged)) {
+                candidateRow.addView(chip("更多 ▸", colors.keyText, colors.key) { showMoreCandidates() })
             }
             return
         }
@@ -502,7 +587,9 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             return
         }
 
-        val before = currentInputConnection?.getTextBeforeCursor(32, 0)?.toString().orEmpty()
+        // 4) 上下文联想（数字识别/邮箱域名）：光标前文是一次跨进程调用，只在真的没有
+        // 组合中的时候才问；已记域名是 JNI，缓存住——只有用户点了某个域名才会变
+        val before = currentInputConnection?.getTextBeforeCursor(TEXT_BEFORE_CHARS, 0)?.toString().orEmpty()
         var shown = false
         TextUtils.mixedDigitSuggestion(before)?.let { (text, replaceLen) ->
             shown = true
@@ -511,10 +598,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 replaceTail(replaceLen, text)
             })
         }
-        for ((domain, suffix) in TextUtils.emailDomainCandidates(before, TypesakeCore.learnedMailDomains())) {
+        for ((domain, suffix) in TextUtils.emailDomainCandidates(before, mailDomains())) {
             shown = true
             candidateRow.addView(chip("$domain", colors.keyText, colors.key) {
                 TypesakeCore.recallMailDomain(domain)
+                mailDomainsCache = null
                 commitRaw(suffix)
             })
         }
@@ -537,8 +625,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private fun flipPage(delta: Int) {
         val size = allCandidates.size
         if (size == 0) return
-        val step = if (prefs.verticalCandidates) 4 else 8
-        pageStart = (pageStart + delta * step).coerceIn(0, ((size - 1) / step) * step)
+        val step = CandidateBar.perPage(prefs.verticalCandidates)
+        pageStart = CandidateBar.pageStart(size, step, pageStart + delta * step)
         renderCandidates()
     }
 
@@ -875,10 +963,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val popup = PopupWindow(row, ViewGroup.LayoutParams.WRAP_CONTENT, dp(44), true).apply {
             isOutsideTouchable = true
         }
-        val anchor = candidateRow
-        val loc = IntArray(2)
-        anchor.getLocationInWindow(loc)
-        popup.showAtLocation(anchor, Gravity.NO_GRAVITY, loc[0] + dp(8), loc[1] + dp(40))
+        if (!showAnchored(popup, candidateRow, dp(8), dp(40))) return
         actionPopup = popup
     }
 
@@ -916,10 +1001,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val popup =
             PopupWindow(box, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
                 .apply { isOutsideTouchable = true }
-        val anchor = candidateRow
-        val loc = IntArray(2)
-        anchor.getLocationInWindow(loc)
-        popup.showAtLocation(anchor, Gravity.NO_GRAVITY, loc[0] + dp(8), loc[1] + dp(40))
+        if (!showAnchored(popup, candidateRow, dp(8), dp(40))) return
         actionPopup = popup
     }
 
@@ -958,8 +1040,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         pinyin.setLength(0)
         candidates = emptyList()
         match = null
-        allCandidates = emptyList()
-        pageStart = 0
+        resetPaging()
         selfEdit = true
         currentInputConnection?.setComposingText(scBuf.toString(), 1)
         updateShortcut()
@@ -1055,8 +1136,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 enBuf.append(text)
                 selfEdit = true
                 digitRun.setLength(0)
-                pageStart = 0
-                allCandidates = emptyList()
+                resetPaging()
                 ic.setComposingText(enBuf.toString(), 1)
                 updateEnglishFix()
                 renderEnglish()
@@ -1180,8 +1260,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             pinyin.setLength(0)
             candidates = emptyList()
             match = null
-            allCandidates = emptyList()
-            pageStart = 0
+            resetPaging()
             selfEdit = true
             digitRun.setLength(0)
             ic.setComposingText(scBuf.toString(), 1)
@@ -1192,8 +1271,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         selfEdit = true
         digitRun.setLength(0)
         // 输入串变了，翻页状态必须归零，否则会显示上一串的候选页
-        pageStart = 0
-        allCandidates = emptyList()
+        resetPaging()
         ic.setComposingText(pinyin.toString(), 1)
         val cached = TypesakeCore.cached(pinyin.toString())
         candidates = cached ?: emptyList()
@@ -1213,15 +1291,16 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             if (t9Mode) {
                 val list = TypesakeCore.t9(p)
                 val cached = TypesakeCore.cached(p)
+                prefetchGloss(list)
+                val hit = list.ifEmpty { cached ?: emptyList() }
                 withContext(Dispatchers.Main) {
                     if (t9buf.toString() == p) {
-                        val hit = list.ifEmpty { cached ?: emptyList() }
                         match = TypesakeCore.Match(matched = p, corrected = false, remembered = false, candidates = hit)
                         candidates = hit
                         renderCandidates()
-                        renderComposingEnglish(hit)
                     }
                 }
+                composingEnglishOnCpu(hit)
                 return@launch
             }
             val m = if (prefs.pageKeys == 1) {
@@ -1230,25 +1309,60 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             } else {
                 TypesakeCore.analyze(p)
             }
+            prefetchGloss(m.candidates)
             withContext(Dispatchers.Main) {
                 if (pinyin.toString() == p) {
                     match = m
                     candidates = m.candidates
                     renderCandidates()
-                    renderComposingEnglish(m.candidates)
                 }
+            }
+            composingEnglishOnCpu(m.candidates)
+        }
+    }
+
+    /**
+     * 行内译词预取（在 cpu 线程跑）。
+     *
+     * 一次 JNI 取回整页，按词缓存；查不到释义的词也缓存 null，避免每帧反复问引擎。
+     */
+    private fun prefetchGloss(words: List<String>) {
+        if (!prefs.gloss || words.isEmpty()) return
+        val missing = synchronized(glossCache) { words.filter { !glossCache.containsKey(it) } }
+        if (missing.isEmpty()) return
+        val got = TypesakeCore.glossLines(missing)
+        synchronized(glossCache) {
+            missing.forEachIndexed { i, w -> glossCache[w] = got.getOrNull(i) }
+            if (glossCache.size > GLOSS_CACHE_MAX) {
+                // 简单的容量控制：留下最近写的一半，其余丢掉（译词命中率本来就高）
+                val drop = glossCache.keys.take(glossCache.size - GLOSS_CACHE_MAX / 2)
+                drop.forEach { glossCache.remove(it) }
             }
         }
     }
 
-    private fun renderComposingEnglish(list: List<String>) {
+    /** 只读缓存的行内译词；没预取到就是 null（下次渲染自动补上，不阻塞当前帧）。 */
+    private fun cachedGloss(words: List<String>): List<TypesakeCore.GlossLine?> {
+        if (!prefs.gloss) return words.map { null }
+        return synchronized(glossCache) { words.map { glossCache[it] } }
+    }
+
+    /**
+     * 组合中的英文伴学：JNI 查询放 cpu 线程，主线程只负责画。
+     *
+     * 调用方都已经在 [lookupJob] 里，所以这里返回后由调用点切回主线程赋值。
+     */
+    private suspend fun composingEnglishOnCpu(list: List<String>) {
         if (englishChips.isNotEmpty()) return
         if (prefs.englishBlockedFor(currentPkg)) return
         val target = list.firstOrNull() ?: return
-        val list = TypesakeCore.englishList(target)
-        if (list.isNotEmpty()) {
-            englishChips = list
-            renderEnglish()
+        val chips = TypesakeCore.englishList(target)
+        if (chips.isEmpty()) return
+        withContext(Dispatchers.Main) {
+            if (englishChips.isEmpty()) {
+                englishChips = chips
+                renderEnglish()
+            }
         }
     }
 
@@ -1267,8 +1381,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val out = applyScript(word)
         ic.commitText(out, 1)
         selfEdit = true
-        pageStart = 0
-        allCandidates = emptyList()
+        resetPaging()
         pinyin.setLength(0)
         t9buf.setLength(0)
         scBuf.setLength(0)
@@ -1291,8 +1404,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val ic = currentInputConnection ?: return
         ic.commitText(text, 1)
         selfEdit = true
-        pageStart = 0
-        allCandidates = emptyList()
+        resetPaging()
         pinyin.setLength(0)
         t9buf.setLength(0)
         scBuf.setLength(0)
@@ -1316,12 +1428,15 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         refreshBars()
     }
 
-    /** A4：候选翻页（最多 24 条） */
+    /** A4：更多候选弹层（引擎一次给 24 条，减去候选条上已有的）。 */
     private fun showMoreCandidates() {
         val typed = if (t9Mode) t9buf.toString() else pinyin.toString()
         if (typed.isEmpty()) return
+        val shown = (match?.candidates ?: candidates).toSet()
         cpu.launch {
-            val list = TypesakeCore.more(typed)
+            // 引擎的 moreCandidates 是把候选池从头重算一遍，前几条必然和条上重复，
+            // 原样弹出来等于「点了没反应」，所以这里先减掉已显示的。
+            val list = CandidateBar.extra(TypesakeCore.more(typed), shown)
             withContext(Dispatchers.Main) { showListPopup(list) }
         }
     }
@@ -1333,7 +1448,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         }
         dismissActionPopup()
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = android.widget.ScrollView(this)
+        val scroll = ScrollView(this)
         for (w in items) {
             column.addView(
                 chip(w, colors.keyText, colors.key) {
@@ -1343,15 +1458,52 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
-                ),
+                ).apply {
+                    marginStart = dp(3)
+                    marginEnd = dp(3)
+                    topMargin = dp(3)
+                    bottomMargin = dp(3)
+                },
             )
         }
         scroll.addView(column)
-        val popup = PopupWindow(scroll, dp(240), dp(260), true).apply { isOutsideTouchable = true }
-        val loc = IntArray(2)
-        candidateRow.getLocationInWindow(loc)
-        popup.showAtLocation(candidateRow, Gravity.NO_GRAVITY, loc[0] + dp(8), loc[1] + dp(44))
+        // 按条数定高：少了留一块空白，多了超出屏幕会被裁
+        val height = (items.size * dp(34) + dp(12)).coerceAtMost(dp(280))
+        val popup = PopupWindow(scroll, dp(240), height, true).apply { isOutsideTouchable = true }
+        if (!showAnchored(popup, candidateRow, dp(8), dp(44))) return
         actionPopup = popup
+    }
+
+    /**
+     * 在锚点下方挂弹层。
+     *
+     * `showAtLocation` 收的是窗口绝对坐标；输入法窗口是整屏宽高、锚在屏幕顶部
+     * （`InputMethodService.onComputeInsets` 会把窗口拉成 MATCH_PARENT + Gravity.TOP，
+     * 顶部留白就是给候选窗用的），所以 `getLocationInWindow` 与屏幕坐标一致。
+     * 但仍要做越界夹取，并且切换输入框的瞬间窗口 token 会失效——失败就当没弹出来，
+     * 不能把输入法带崩。
+     */
+    private fun showAnchored(popup: PopupWindow, anchor: View, xOff: Int, yOff: Int): Boolean {
+        val loc = IntArray(2)
+        anchor.getLocationInWindow(loc)
+        val dm = resources.displayMetrics
+        val belowTop = loc[1] + yOff
+        val belowRoom = (dm.heightPixels - belowTop).coerceAtLeast(dp(MIN_POPUP_DP))
+        // 下方放不下先压高度；连最小高度都放不下才往锚点上方翻（键盘很高/横屏时才会走到）
+        if (popup.height > belowRoom) popup.height = belowRoom
+        val aboveTop = loc[1] - dp(4) - popup.height
+        val y = if (belowRoom < dp(FLIP_UP_DP) && aboveTop >= 0) {
+            aboveTop
+        } else {
+            belowTop.coerceIn(0, (dm.heightPixels - popup.height).coerceAtLeast(0))
+        }
+        val x = (loc[0] + xOff).coerceIn(0, (dm.widthPixels - popup.width).coerceAtLeast(0))
+        return try {
+            popup.showAtLocation(anchor, Gravity.NO_GRAVITY, x, y)
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun commitTopCandidate() {
@@ -1363,11 +1515,27 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         if (pinyin.isNotEmpty()) commitCandidate(top)
     }
 
+    /**
+     * 上屏后的英文候选 + 联想。
+     *
+     * `englishList` / `predict` 都是跨 FFI 的查询，别在主线程问；先渲染空条，
+     * 结果回来再补一次（`refreshBars` 幂等）。
+     */
     private fun afterCommit(word: String) {
-        englishChips = TypesakeCore.englishList(word)
-        predictions = TypesakeCore.predict(word)
+        englishChips = emptyList()
+        predictions = emptyList()
         refreshBars()
         io.launch { TypesakeCore.bump(LocalDate.now().toString()) }
+        cpu.launch {
+            val chips = TypesakeCore.englishList(word)
+            val next = TypesakeCore.predict(word)
+            prefetchGloss(next)
+            withContext(Dispatchers.Main) {
+                englishChips = chips
+                predictions = next
+                refreshBars()
+            }
+        }
     }
 
     private fun commitDigitDecoration(text: String) {
@@ -1385,10 +1553,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         ic.commitText(applyScript(word), 1)
         lastCommittedChinese = word
         TypesakeCore.context(word)
-        englishChips = TypesakeCore.englishList(word)
-        predictions = TypesakeCore.predict(word)
-        refreshBars()
-        io.launch { TypesakeCore.bump(LocalDate.now().toString()) }
+        afterCommit(word)
     }
 
     private fun insertEnglish(english: String) {
@@ -1398,8 +1563,16 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         ic.commitText(if (prefs.englishAutoSpace) "$english " else english, 1)
         digitRun.setLength(0)
         predictions = emptyList()
-        englishChips = TypesakeCore.englishList(lastCommittedChinese)
+        val word = lastCommittedChinese
+        englishChips = emptyList()
         refreshBars()
+        cpu.launch {
+            val chips = TypesakeCore.englishList(word)
+            withContext(Dispatchers.Main) {
+                englishChips = chips
+                refreshBars()
+            }
+        }
     }
 
     /** 长按英文：把刚上屏的中文替换成英文（中英混输的"改写"用法）。 */
@@ -1530,8 +1703,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             pinyin.deleteCharAt(pinyin.length - 1)
             selfEdit = true
             // 输入串变了，翻页状态归零（否则显示上一串的候选页）
-            pageStart = 0
-            allCandidates = emptyList()
+            resetPaging()
             if (pinyin.isEmpty()) {
                 ic.setComposingText("", 1)
                 candidates = emptyList()
@@ -1607,8 +1779,9 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     override fun onShowLayer(l: KbLayer) {
         layer = l
-        if (l == KbLayer.PHRASES) phrases = loadPhrases()
-        keyboard.render(kind, layer, colors, prefs.keyHeightDp, clipItems.toList(), pairList())
+        // 常用语页要现读收藏（列表可能被改过），仍走异步，别在主线程解 JSON
+        if (l == KbLayer.PHRASES) loadPhrasesAsync()
+        renderKeyboard()
     }
 
     override fun onLanguage() {
@@ -1645,10 +1818,7 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         prefs.englishMode = englishMode
         if (englishMode && pinyin.isNotEmpty()) commitTopCandidate()
         toast(if (englishMode) "英文输入" else "中文输入")
-        keyboard.render(
-            kind, layer, colors, prefs.keyHeightDp, clipItems.toList(),
-            pairList(), prefs.customSymbols, englishMode, prefs.hideNumberRow,
-        )
+        renderKeyboard()
         refreshBars()
     }
 
@@ -1783,6 +1953,21 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         const val DOUBLE_TAP_MS = 420L
         const val MAX_CLIP = 20
         const val CAND_BAR_DP = 44
+
+        /** 竖排候选条高度：一屏 4 条（每条 ~32dp）+ 翻页/更多按钮，仍不够就靠外层滚动 */
+        const val CAND_BAR_VERTICAL_DP = 152
         const val EN_BAR_DP = 36
+
+        /** 行内译词缓存上限（超出后丢一半，避免常驻内存无界增长） */
+        const val GLOSS_CACHE_MAX = 512
+
+        /** 上下文联想要读多少个字符 */
+        const val TEXT_BEFORE_CHARS = 32
+
+        /** 弹层最小高度（下方空间太小时宁可压到这个高度） */
+        const val MIN_POPUP_DP = 96
+
+        /** 下方空间少于这个高度就改挂到锚点上方 */
+        const val FLIP_UP_DP = 140
     }
 }

@@ -37,10 +37,21 @@ object KbThemes {
     const val CORAL = 0xFFD97757.toInt()
     /** 暖米白（背景 / 深色底上的文字） */
     const val CREAM = 0xFFFAF9F5.toInt()
-    /** 中灰（次要文本、分割线、弱化元素） */
-    const val WARM_GRAY = 0xFFB0AEA5.toInt()
+    /**
+     * 中灰（次要文本、分割线、弱化元素）。
+     *
+     * 浅色皮肤上的次要文字要 ≥4.5:1：写在浅灰键帽/奶油候选条上都过线，
+     * 深色皮肤另配一个更亮的灰（见 [KbThemes.coralDark]）。
+     */
+    const val WARM_GRAY = 0xFF63615A.toInt()
+    /** 浅色皮肤次要文字 */
+    const val LIGHT_HINT = 0xFF5C5A52.toInt()
+    /** 深色皮肤次要文字 */
+    const val DARK_HINT = 0xFF96A3B2.toInt()
     /** 浅灰（细微背景、输入框、卡片底） */
     const val LIGHT_GRAY = 0xFFE8E6DC.toInt()
+    /** 纯白（深色强调色上的文字） */
+    const val WHITE = 0xFFFFFFFF.toInt()
     /** 尘蓝（信息提示/链接/次要按钮） */
     const val DUST_BLUE = 0xFF6A9BCC.toInt()
     /** 鼠尾草绿（成功/有机元素） */
@@ -61,7 +72,7 @@ object KbThemes {
         actionKey = 0x99DCD9CC.toInt(),
         actionText = 0xFF3A3631.toInt(),
         accent = CORAL,
-        accentText = 0xFFFFFFFF.toInt(),
+        accentText = accentTextOf(CORAL),
         barBg = 0xCCFAF9F5.toInt(),
         barText = 0xFF4A2C1E.toInt(),
         hint = WARM_GRAY,
@@ -77,10 +88,10 @@ object KbThemes {
         actionKey = 0x992A2622.toInt(),
         actionText = 0xFFE8E2DA.toInt(),
         accent = CORAL,
-        accentText = 0xFFFFFFFF.toInt(),
+        accentText = accentTextOf(CORAL),
         barBg = 0xCC26221F.toInt(),
         barText = 0xFFF1E4DA.toInt(),
-        hint = WARM_GRAY,
+        hint = DARK_HINT,
         glassBorder = 0x33FFFFFF.toInt(),
         glass = true,
     )
@@ -103,10 +114,10 @@ object KbThemes {
             actionKey = 0xFFB9C2D0.toInt(),
             actionText = 0xFF1B2430.toInt(),
             accent = accent,
-            accentText = 0xFFFFFFFF.toInt(),
+            accentText = accentTextOf(accent),
             barBg = barBg,
             barText = barText,
-            hint = 0xFF6B7887.toInt(),
+            hint = LIGHT_HINT,
         )
     }
 
@@ -126,10 +137,10 @@ object KbThemes {
             actionKey = 0xFF1D2530.toInt(),
             actionText = 0xFFD7DEE7.toInt(),
             accent = accent,
-            accentText = 0xFF05221A.toInt(),
+            accentText = accentTextOf(accent),
             barBg = barBg,
             barText = barText,
-            hint = 0xFF8A97A6.toInt(),
+            hint = DARK_HINT,
         )
     }
 
@@ -150,5 +161,42 @@ object KbThemes {
 
     /** 配色预览色（设置页色块 / Compose 主题用）。 */
     fun accentOf(palette: KbPalette, night: Boolean): Int =
-        resolve(palette, THEME_SYSTEM, night).accent
+        resolve(palette, KbThemes.THEME_SYSTEM, night).accent
+
+    // ---------------- 无障碍对比度（WCAG 2.x） ----------------
+
+    /**
+     * 强调色上的文字色：白字过不了 4.5:1 就换深棕。
+     *
+     * 纯函数所以可单测——珊瑚橙上白字只有 3.12:1，而翠绿/暖阳/玫瑰/海洋白字都在
+     * 4.9:1 以上，固定用一种颜色必然有一半皮肤不达标。
+     */
+    fun accentTextOf(accent: Int): Int =
+        if (contrastRatio(WHITE, accent) >= 4.5) WHITE else 0xFF2A1005.toInt()
+
+    private fun channel(v: Int): Double {
+        val c = v / 255.0
+        return if (c <= 0.03928) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    private fun relativeLuminance(color: Int): Double {
+        val r = channel((color shr 16) and 0xFF)
+        val g = channel((color shr 8) and 0xFF)
+        val b = channel(color and 0xFF)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /**
+     * 前景/背景对比度（1:1 ~ 21:1）。
+     *
+     * 半透明色（键帽/候选条带 alpha）只取其 RGB 当不透明色算：玻璃皮肤真正的背景是
+     * 宿主应用，alpha 参与进来只会让断言变得不可复现。
+     */
+    fun contrastRatio(fg: Int, bg: Int): Double {
+        val lf = relativeLuminance(fg)
+        val lb = relativeLuminance(bg)
+        val hi = maxOf(lf, lb)
+        val lo = minOf(lf, lb)
+        return (hi + 0.05) / (lo + 0.05)
+    }
 }

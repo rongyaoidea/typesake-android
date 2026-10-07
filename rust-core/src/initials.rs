@@ -162,9 +162,15 @@ pub fn candidates(input: &str, limit: usize) -> Vec<String> {
         hits.extend(v.iter().cloned());
     }
     if hits.len() < limit {
+        // 前缀扩展会扫整张表（最多 9 万个声母串），每命中一个桶就把 16 个词全 clone 出来。
+        // 攒够 limit * 4 就够后面排序用了，多 clone 的那些纯属浪费。
+        let want = limit * 4;
         for (k, v) in t.iter() {
             if k.len() > key.len() && k.starts_with(&key) {
                 hits.extend(v.iter().cloned());
+                if hits.len() >= want {
+                    break;
+                }
             }
         }
     }

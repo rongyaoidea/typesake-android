@@ -13,7 +13,7 @@
 
 use crate::{biglex, initials, mixed, shuangpin, t9};
 use inputx_pinyin::{L0Snapshot, PinyinEngine};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -120,13 +120,16 @@ fn rerank_with_context(cands: &mut [String]) {
     }
     let n = cands.len().min(5);
     let dict = engine().dict();
-    let mut head: Vec<String> = cands[..n].to_vec();
-    head.sort_by(|a, b| {
-        let ba = dict.bigram_boost(Some(&prev), a);
-        let bb = dict.bigram_boost(Some(&prev), b);
-        bb.partial_cmp(&ba).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    cands[..n].clone_from_slice(&head);
+    // 先把分数算出来再排：原来在比较器里调 bigram_boost，一次排序要做 O(n log n)
+    // 次 FST 探测（每次还会克隆一遍 prev）
+    let mut head: Vec<(f64, String)> = cands[..n]
+        .iter()
+        .map(|w| (dict.bigram_boost(Some(&prev), w), w.clone()))
+        .collect();
+    head.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (slot, (_, w)) in cands[..n].iter_mut().zip(head.into_iter()) {
+        *slot = w;
+    }
 }
 
 /// 扩展候选（候选翻页用）：不走纠错，只要更多候选。
@@ -135,7 +138,7 @@ pub fn more_candidates(input: &str, limit: usize) -> Vec<String> {
     if compact.is_empty() {
         return Vec::new();
     }
-    let mut out = filter_blocked(&compact, candidates_with(engine(), &compact, limit));
+    let mut out = filter_blocked(&compact, candidates_cached(engine(), &compact, limit));
     if out.len() < limit {
         for w in mixed::compose(engine(), &compact, limit) {
             if !out.contains(&w) {
@@ -167,15 +170,21 @@ pub fn more_candidates(input: &str, limit: usize) -> Vec<String> {
             }
         }
     }
+    out.truncate(limit);
+    // 人名词库必须和 analyze 一致：少了这一步，翻页/「更多」就会把人名候选漏掉
+    merge_personal(&mut out, &compact, limit);
     rerank_with_context(&mut out);
     out
 }
 
 /// 九键候选（数字串 -> 候选），带上下文重排。
+///
+/// 黑名单按拼音串存（`forget` 里写的是 `canonical(pinyin)`），而九键这条路径手上
+/// 只有词没有拼音——所以退一步按词过滤：这个词在任何拼音下被删过就不再给，
+/// 否则九键下删掉的词还会继续冒出来。
 pub fn t9_candidates(digits: &str, limit: usize) -> Vec<String> {
     let raw = t9::candidates(digits, limit);
-    let key: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
-    let mut out = filter_blocked(&key, raw);
+    let mut out = filter_blocked_words(raw);
     rerank_with_context(&mut out);
     out
 }
@@ -264,15 +273,34 @@ fn is_blocked(pinyin: &str, word: &str) -> bool {
 }
 
 fn filter_blocked(pinyin: &str, list: Vec<String>) -> Vec<String> {
-    if blocked()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-    {
+    let m = blocked().lock().unwrap_or_else(|e| e.into_inner());
+    if m.is_empty() {
         return list;
     }
+    // 锁和 key 规范化都只做一次：`is_blocked` 每个候选都要重新加锁 + 重新 normalize，
+    // 纠错路径上会被放大到上百次
+    let key = normalize(pinyin);
+    match m.get(&key) {
+        Some(banned) if !banned.is_empty() => list
+            .into_iter()
+            .filter(|w| !banned.iter().any(|b| b == w))
+            .collect(),
+        _ => list,
+    }
+}
+
+/// 按词过滤黑名单（九键路径用：只有词，没有拼音可用）。
+fn filter_blocked_words(list: Vec<String>) -> Vec<String> {
+    let m = blocked().lock().unwrap_or_else(|e| e.into_inner());
+    if m.is_empty() {
+        return list;
+    }
+    let banned: HashSet<&str> = m
+        .values()
+        .flat_map(|v| v.iter().map(|w| w.as_str()))
+        .collect();
     list.into_iter()
-        .filter(|w| !is_blocked(pinyin, w))
+        .filter(|w| !banned.contains(w.as_str()))
         .collect()
 }
 
@@ -323,6 +351,59 @@ fn push_unique(out: &mut Vec<String>, word: String, limit: usize) {
     if !out.iter().any(|w| w == &word) {
         out.push(word);
     }
+}
+
+/// 缓存里统一按这个上限存，读的时候再截到调用方要的条数。
+///
+/// 候选组装是「同一个来源按固定顺序往后追加」，所以 24 条的前 8 条与直接算 8 条
+/// 完全一致，按大上限存一份、小上限截着读不会串味。
+const CACHE_LIMIT: usize = 24;
+
+/// 带缓存的候选组装：引擎的精确命中 / 整句组合 / 前缀补全都在里面，
+/// 是每键最贵的一段。选词、置顶、删词、导入 L0、换方案都会清 `cache()`，所以命中是安全的。
+fn candidates_cached(eng: &PinyinEngine, compact: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    {
+        let c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = c.get(compact) {
+            if hit.len() >= limit {
+                let mut v = hit.clone();
+                v.truncate(limit);
+                return v;
+            }
+        }
+    }
+    let out = candidates_with(eng, compact, CACHE_LIMIT);
+    {
+        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() >= CACHE_CAP {
+            c.clear();
+        }
+        c.insert(compact.to_string(), out.clone());
+    }
+    let mut v = out;
+    v.truncate(limit);
+    v
+}
+
+/// 个人词库（名单/通讯录导入）并到候选前面：姓名是强个人信号。
+///
+/// `analyze` 与 `more_candidates` 都必须走这里，否则翻页/「更多」会把人名丢掉。
+fn merge_personal(out: &mut Vec<String>, compact: &str, limit: usize) {
+    let personal = crate::store::user_words_for(compact, 2);
+    if personal.is_empty() {
+        return;
+    }
+    let mut merged = personal;
+    for w in out.iter() {
+        if !merged.contains(w) {
+            merged.push(w.clone());
+        }
+    }
+    merged.truncate(limit);
+    *out = merged;
 }
 
 /// 廉价查询：只做精确 + 前缀（用于纠错变体，避免每条都跑 Viterbi）。
@@ -539,23 +620,7 @@ pub fn candidates(input: &str, limit: usize) -> Vec<String> {
     if compact.is_empty() {
         return Vec::new();
     }
-    {
-        let c = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = c.get(&compact) {
-            let mut v = hit.clone();
-            v.truncate(limit);
-            return v;
-        }
-    }
-    let out = candidates_with(engine(), &compact, limit);
-    {
-        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if c.len() >= CACHE_CAP {
-            c.clear();
-        }
-        c.insert(compact, out.clone());
-    }
-    out
+    candidates_cached(engine(), &compact, limit)
 }
 
 // ---------------- 纠错变体 ----------------
@@ -649,14 +714,29 @@ fn neighbors(c: char) -> &'static [char] {
 /// 插入候选（漏键）：常见元音与鼻音尾。
 const INSERT_CHARS: &[char] = &['a', 'e', 'i', 'o', 'u', 'n', 'g', 'h'];
 
+/// 击键变体上限：再往下每个变体都要跑一次廉价查询，收益递减。
+const MAX_VARIANTS: usize = 40;
+
+/// 收一个击键变体：哈希去重 + 到量收手。
+fn push_variant(out: &mut Vec<(u8, String)>, seen: &mut HashSet<String>, cost: u8, v: String) {
+    if out.len() >= MAX_VARIANTS {
+        return;
+    }
+    if seen.insert(v.clone()) {
+        out.push((cost, v));
+    }
+}
+
 /// 击键纠错变体：(代价, 变体)。代价越小越可能是真实意图。
 pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
     let chars: Vec<char> = input.chars().collect();
-    let mut out: Vec<(u8, String)> = Vec::new();
     if chars.len() < 2 {
-        return out;
+        return Vec::new();
     }
-
+    // 变体在生成时就按 HashSet 去重：原来先物化全部（约 157 个 String）再用
+    // `seen.contains` 线性扫，换成哈希查找后同一串输入的分配和比较都少一个量级。
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<(u8, String)> = Vec::new();
     // cost 1: 相邻换位
     for i in 0..chars.len() - 1 {
         if chars[i] == chars[i + 1] {
@@ -664,44 +744,36 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
         }
         let mut v = chars.clone();
         v.swap(i, i + 1);
-        out.push((1, v.into_iter().collect()));
+        let s: String = v.into_iter().collect();
+        if s != input {
+            push_variant(&mut out, &mut seen, 1, s);
+        }
     }
     // cost 1: 邻键替换
     for i in 0..chars.len() {
         for n in neighbors(chars[i]) {
             let mut v = chars.clone();
             v[i] = *n;
-            out.push((1, v.into_iter().collect()));
+            push_variant(&mut out, &mut seen, 1, v.into_iter().collect());
         }
     }
     // cost 2: 多按一键 -> 删一个
     for i in 0..chars.len() {
         let mut v = chars.clone();
         v.remove(i);
-        out.push((2, v.into_iter().collect()));
+        push_variant(&mut out, &mut seen, 2, v.into_iter().collect());
     }
     // cost 3: 漏按一键 -> 插一个
     for i in 0..=chars.len() {
         for c in INSERT_CHARS {
             let mut v = chars.clone();
             v.insert(i, *c);
-            out.push((3, v.into_iter().collect()));
+            push_variant(&mut out, &mut seen, 3, v.into_iter().collect());
         }
     }
 
     out.sort_by_key(|a| a.0);
-    let mut seen: Vec<String> = Vec::new();
-    let mut deduped: Vec<(u8, String)> = Vec::new();
-    for (cost, v) in out {
-        if v != input && !seen.contains(&v) {
-            seen.push(v.clone());
-            deduped.push((cost, v));
-        }
-        if deduped.len() >= 40 {
-            break;
-        }
-    }
-    deduped
+    out
 }
 
 /// 完整分析：候选 + 是否纠错 + 命中拼音。
@@ -720,7 +792,7 @@ pub fn analyze(input: &str, limit: usize) -> Match {
     let mut exact: Vec<String> = Vec::new();
     eng.dict().lookup_into(&compact, &mut exact);
 
-    let mut direct = filter_blocked(&compact, candidates_with(eng, &compact, limit));
+    let mut direct = filter_blocked(&compact, candidates_cached(eng, &compact, limit));
     // 大词库补充（jieba/Rime 生成的 lex.bin）：精确优先，其次前缀
     if direct.len() < limit {
         for w in biglex::exact(&compact, 2) {
@@ -737,18 +809,7 @@ pub fn analyze(input: &str, limit: usize) -> Match {
         }
     }
     direct.truncate(limit);
-    // 个人词库（名单/通讯录导入）优先：姓名是强个人信号
-    let personal = crate::store::user_words_for(&compact, 2);
-    if !personal.is_empty() {
-        let mut merged = personal;
-        for w in direct {
-            if !merged.contains(&w) {
-                merged.push(w);
-            }
-        }
-        merged.truncate(limit);
-        direct = merged;
-    }
+    merge_personal(&mut direct, &compact, limit);
     rerank_with_context(&mut direct);
     if !exact.is_empty() {
         return Match {
@@ -874,7 +935,7 @@ pub fn record_pick(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
         c.remove(&compact);
     }
     t9::clear_cache();
-    candidates_with(engine(), &compact, limit)
+    candidates_cached(engine(), &compact, limit)
 }
 
 /// 置顶：把某个候选固定在该拼音的首位（用户主动 pin）。
@@ -889,7 +950,7 @@ pub fn pin(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.remove(&compact);
     }
-    candidates_with(engine(), &compact, limit)
+    candidates_cached(engine(), &compact, limit)
 }
 
 /// 已删词黑名单（供设置页恢复）。
@@ -945,7 +1006,7 @@ pub fn forget(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
         c.remove(&compact);
         c.clear();
     }
-    candidates_with(engine(), &compact, limit)
+    candidates_cached(engine(), &compact, limit)
 }
 
 /// 用户词库视图：(拼音, 词, 选词次数)。pin 的 count 记为 0（表示已固定首位）。

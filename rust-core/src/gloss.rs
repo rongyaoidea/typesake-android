@@ -124,6 +124,11 @@ fn longest(chars: &[char], start: usize) -> Option<(usize, String)> {
 /// 先查整词；查不到就按最长匹配切开拼（`今天天气` -> `today weather` 的
 /// 各段释义用空格连起来）。完全没命中返回 `None`。
 pub fn short_gloss(zh: &str) -> Option<String> {
+    short_gloss_of(zh, &segment(zh.trim()))
+}
+
+/// 已经切好词的版本：调用方本来就有 `pieces` 时别再切一遍（`gloss_line` 每键按词走一趟）。
+pub(crate) fn short_gloss_of(zh: &str, pieces: &[Piece]) -> Option<String> {
     let t = zh.trim();
     if t.is_empty() {
         return None;
@@ -134,7 +139,6 @@ pub fn short_gloss(zh: &str) -> Option<String> {
             return Some(trim_en(&s));
         }
     }
-    let pieces = segment(t);
     if pieces.is_empty() {
         return None;
     }
@@ -152,8 +156,10 @@ pub fn short_gloss(zh: &str) -> Option<String> {
 
 /// 候选行内要显示的一行：`(短译, 级别)`。短译查不到返回 `None`（该行不显示译词）。
 pub fn gloss_line(zh: &str) -> Option<(String, &'static str)> {
-    let en = short_gloss(zh)?;
-    let level = segment(zh)
+    // 切词只做一次：原来 short_gloss 里切一遍，这里为了取级别又切一遍
+    let pieces = segment(zh.trim());
+    let en = short_gloss_of(zh, &pieces)?;
+    let level = pieces
         .iter()
         .find_map(|p| {
             if p.level.is_empty() {

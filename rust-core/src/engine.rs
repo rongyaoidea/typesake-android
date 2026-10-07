@@ -127,7 +127,7 @@ fn rerank_with_context(cands: &mut [String]) {
         .map(|w| (dict.bigram_boost(Some(&prev), w), w.clone()))
         .collect();
     head.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (slot, (_, w)) in cands[..n].iter_mut().zip(head.into_iter()) {
+    for (slot, (_, w)) in cands[..n].iter_mut().zip(head) {
         *slot = w;
     }
 }

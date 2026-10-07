@@ -78,12 +78,12 @@ pub fn load_bytes(data: Vec<u8>) -> usize {
     // 上面三轮长度扫描都按索引读 `data`（u16_at/u32_at 是直接下标），
     // 文件被截断就会 panic —— 这个函数从 FFI 的 initStorage/importBackup 能走到，
     // 必须先确认每张表的区间都在缓冲区内（biglex.rs / gramidx.rs 也是这么守的）。
-    let zh_end = zh_blob.checked_add(zh_len).unwrap_or(usize::MAX);
-    let en_end = en_blob.checked_add(en_len).unwrap_or(usize::MAX);
-    let gram_end = gram_blob.checked_add(g_len).unwrap_or(usize::MAX);
-    if sent_idx.checked_add(sent_count * SENT_REC).is_none()
-        || gram_idx.checked_add(gram_count * GRAM_REC).is_none()
-        || postings.checked_add(postings_len).is_none()
+    let zh_end = zh_blob.saturating_add(zh_len);
+    let en_end = en_blob.saturating_add(en_len);
+    let gram_end = gram_blob.saturating_add(g_len);
+    if sent_idx.saturating_add(sent_count.saturating_mul(SENT_REC)) > data.len()
+        || gram_idx.saturating_add(gram_count.saturating_mul(GRAM_REC)) > data.len()
+        || postings.saturating_add(postings_len) > data.len()
         || zh_blob > data.len()
         || zh_end > en_blob
         || en_blob > data.len()

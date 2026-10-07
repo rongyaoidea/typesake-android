@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Typesake promo</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{width:1920px;height:1080px;overflow:hidden;background:#FAF9F5;
+       font-family:'Noto Sans CJK SC','PingFang SC','Microsoft YaHei',Geist,Archive,Arial,sans-serif;
+       color:#1a1a1a}
+  .abs{position:absolute}
+  .card{position:absolute;left:50%;top:50%;}
+  .pill{display:inline-block;padding:10px 26px;border-radius:999px;background:#1a1a1a;color:#FAF9F5;font-size:26px;font-weight:600}
+  .chip{display:inline-block;padding:6px 14px;border-radius:8px;background:#E8E6DC;color:#4A2C1E;font-size:22px;font-weight:500;margin:4px}
+  .seg{position:absolute;background:#F7EDE6;border-radius:12px;border:1px solid #E8E6DC}
+  .key{display:inline-flex;align-items:center;justify-content:center;background:#fff;border:1px solid #DCD9CE;
+       border-radius:10px;color:#33312E;font-size:24px;box-shadow:0 2px 0 #DCD9CE}
+  .gloss{color:#6B7887}
+  .tag{display:inline-block;padding:2px 10px;border-radius:6px;font-size:18px;background:#D97757;color:#fff;margin-right:8px}
+</style></head><body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const CORAL='#D97757',CREAM='#FAF9F5',INK='#1a1a1a',SUB='#6B7887',LINE='#E8E6DC';
+
+// ---- setup ----
+const BTSPN=26; // 120BPM
+function lerp(a,b,k){return a+(b-a)*k}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function ease(k){return k<.5?4*k*k*k:1-Math.pow(-2*k+2,3)/2}
+function win(t,t0,t1){return clamp((t-t0)/(t1-t0),0,1)}
+function sliceLen(t,f){return Math.floor(f*(t*1))/Math.max(1,1)} /* not used */
+// typing reveal: given t in scene, chars shown = floor((t - t0)/dt)
+function reveal(t,t0,perS,s){return s.slice(0,Math.max(0,Math.floor((t-t0)/perS)))}
+
+function rrect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
+function txt(s,x,y,size,weight,color,align='left',font){ctx.fillStyle=color;ctx.font=(weight||500)+' '+size+'px '+(font||'"Noto Sans CJK SC",Arial,sans-serif');ctx.textAlign=align;ctx.textBaseline='middle';ctx.fillText(s,x,y)}
+function bg(c=CREAM){ctx.fillStyle=c;ctx.fillRect(0,0,1440,1440)}
+
+// draw the glass keyboard at bottom of phone area (x0,y0 = keyboard top-left, w,h total)
+function drawKeyboard(x0,y0,w,gh){
+  rrect(x0,y0,w,gh,24);ctx.fillStyle='#FAF9F5';ctx.fill();ctx.strokeStyle='#E8E6DC';ctx.stroke();
+  const rows=['qwertyuiop','asdfghjkl','zxcvbnm'];
+  const rr=gh/6;
+  ctx.fillStyle=INK;
+  let y=y0+rr*0.8;
+  for(const r of rows){
+    const kw=(w-40)/(r.length+1),kh=rr*0.8;
+    let x=x0+20+(w-40-kw*r.length)/2;
+    for(const c of r){
+      rrect(x,y,kw-6,kh,10);ctx.fillStyle='#fff';ctx.fill();ctx.strokeStyle='#DCD9CE';ctx.stroke();
+      txt(c,x+(kw-6)/2,y+kh/2,22,500,INK,'center');
+      x+=kw;
+    }
+    y+=kh+10;
+  }
+  // space row
+  const kh2=rr*0.8;
+  rrect(x0+20,y,w-40,kh2,10);ctx.fillStyle='#fff';ctx.fill();ctx.strokeStyle='#DCD9CE';ctx.stroke();
+  txt('空格',x0+w/2,y+kh2/2,22,500,INK,'center');
+}
+
+// candidate bar under composing line
+function drawCandidates(y,items){
+  ctx.strokeStyle=LINE;ctx.beginPath();ctx.moveTo(160,y-70);ctx.lineTo(1280,y-70);ctx.stroke();
+  let x=170;
+  for(const it of items){
+    const w=ctx.measureText(it).width*1+90;
+    ctx.fillStyle='#E8E6DC';rrect(x,y-45,80,60,12);ctx.fill();
+    txt(it,x+40,y-15,34,600,CORAL,'center');
+    x+=100;
+  }
+}
+
+// ---- scenes ----
+let T0=0;
+const SC={}
+const T={
+ s1:0,   s1d:2.5,
+ s2:2.5, s2d:3.0,
+ s3:5.5, s3d:3.0,
+ s4:8.5, s4d:3.0,
+ s5:11.5,s5d:2.5,
+ s6:14,  s6d:3.0,
+ s7:17,  s7d:2.0,
+ s8:19.0,s8d:1.0,
+ END:24.0
+};
+
+function sceneOpacity(t,s,d){
+  // fade in 0.25, out 0.25
+  const i=win(t,s,s+0.25), o=win(t,s+d-0.25,s+d);
+  return clamp(i-o,0,1);
+}
+
+function drawPhoneBody(x,y,w,h,glass){
+  rrect(x,y,w,h,40);
+  ctx.fillStyle=glass? 'rgba(253,247,238,.92)':'#fff';ctx.fill();
+  ctx.strokeStyle='#EFEAe0';ctx.lineWidth=3;ctx.stroke();
+}
+
+function typing(s)
+{ return s; }
+
+function seek(t){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#FAF9F5';ctx.fillRect(0,0,1920,1080);
+  ctx.save();
+  ctx.translate(960,540);ctx.scale(0.75,0.75);ctx.translate(-720,-720);
+  bg();
+  // --- global corner beat lines ---
+  ctx.strokeStyle=LINE;ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(60,60);ctx.lineTo(140,60);ctx.moveTo(60,60);ctx.lineTo(60,140);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(1380,1380);ctx.lineTo(1300,1380);ctx.moveTo(1380,1380);ctx.lineTo(1380,1300);ctx.stroke();
+
+  // S1 wordmark
+  if(t<3.5){
+    const k=win(t,0.2,1.0); const r=lerp(8,26,ease(k));
+    ctx.fillStyle=CORAL;ctx.beginPath();ctx.arc(720-200,720,r,0,7);ctx.fill();
+    if(t>0.8){
+      const k2=win(t,0.8,1.8);
+      ctx.globalAlpha=k2;
+      txt('Typesake',720,700,86,800,INK,'center','"Noto Serif CJK SC",Georgia,serif');
+      txt('把中文输入，变成英语口语',720,790,30,500,SUB,'center');
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // S2 phone + keyboard + typing
+  if(t>=2.5 && t<6.0){
+    const a=sceneOpacity(t,2.5,3.0); ctx.globalAlpha=a;
+    drawPhoneBody(360,120,720,1200);
+    // composing
+    ctx.fillStyle=INK;ctx.font='40px "Noto Sans CJK SC",Arial';ctx.textAlign='left';
+    const typed=reveal(t,3.0,0.12,'nihao');
+    ctx.fillText(typed,420,260);
+    ctx.fillStyle=CORAL;ctx.fillRect(430+typed.length*22,222,3,48);
+    if(typed.length>0){
+      // candidate bar
+      ctx.strokeStyle=LINE;ctx.beginPath();ctx.moveTo(400,330);ctx.lineTo(1040,330);ctx.stroke();
+      const cands=['你好','你好吗','你好啊'];
+      let x=420;for(let i=0;i<3;i++){ctx.fillStyle=i===0?'#FDECE5':'#F5F3EB';rrect(x,360,120,110,14);ctx.fill();txt(cands[i],x+60,420,40,600,i===0?CORAL:INK,'center');x+=140;}
+      txt('nǐhǎo · hello · 你好！',420,510,26,500,'#6B7887');
+    }
+    drawKeyboard(360,1010,720,310,true);
+    ctx.globalAlpha=1;
+  }
+
+  // S3 English learning line
+  if(t>=5.5 && t<9.0){
+    const a=sceneOpacity(t,5.5,3.0);ctx.globalAlpha=a;
+    txt('今天天气很好',720,560,64,600,INK,'center');
+    const line=reveal(t,6.0,0.06,'It is a nice day today.');
+    txt(line,720,680,44,500,CORAL,'center');
+    ctx.fillStyle='#F0DED2';rrect(720-70,760,140,56,10);ctx.fill();
+    txt('CEFR A1',720,790,26,600,'#B4560E','center');
+    ctx.globalAlpha=1;
+  }
+
+  // S4 correction
+  if(t>=8.5 && t<12.0){
+    const a=sceneOpacity(t,8.5,3.0);ctx.globalAlpha=a;
+    txt('自动纠错',720,500,34,600,CORAL,'center');
+    if(t<10.4){
+      const s=reveal(t,9.0,0.09,'zhnag');
+      txt(s,720,620,64,500,INK,'center');
+      if(t>10.0){ctx.strokeStyle=CORAL;ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(600,652);ctx.lineTo(840,652);ctx.stroke();}
+    } else {
+      txt('你好',720,620,64,600,INK,'center');
+      txt('“zhnag” → “nihao” · 纠',720,720,26,500,'#B4560E','center');
+    }
+    txt('错拼也能落在候选上',720,820,26,500,SUB,'center');
+    ctx.globalAlpha=1;
+  }
+
+  // S5 shortcuts
+  if(t>=11.5 && t<14.5){
+    const a=sceneOpacity(t,11.5,2.5);ctx.globalAlpha=a;
+    txt('一笔可解的快捷输入',720,360,40,600,INK,'center');
+    const data=[['v3*7','21','算式'],['i2026','二〇二六','中文数字'],['im123.45','壹佰贰拾叁元肆角伍分','金额'],['u4e0a','上','字符']];
+    let y=480;
+    for(let i=0;i<4;i++){
+      const yy=y+i*160;
+      ctx.fillStyle='#fff';rrect(220,yy,1000,120,16);ctx.fill();ctx.strokeStyle=LINE;ctx.stroke();
+      txt(data[i][0],260,yy+60,34,600,INK);
+      txt('→ '+data[i][1],560,yy+60,34,600,CORAL);
+      txt(data[i][2],1140,yy+60,26,500,SUB);
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // S6 study center + heatmap
+  if(t>=14.0 && t<17.5){
+    const a=sceneOpacity(t,14,3.0);ctx.globalAlpha=a;
+    txt('收藏 · 学习中心',720,300,40,600,INK,'center');
+    ctx.fillStyle='#fff';rrect(300,380,840,180,16);ctx.fill();ctx.strokeStyle=LINE;ctx.stroke();
+    txt('请发送报告',350,450,34,600,INK);txt('Please send the report.',350,510,28,500,CORAL);
+    // heatmap
+    txt('最近 12 周输入热力',350,650,26,500,SUB);
+    for(let w=0;w<12;w++)for(let d=0;d<7;d++){
+      const on=((w*7+d)*7%5)<2;
+      const age=(w*7+d)/84;
+      ctx.fillStyle=on?`rgba(217,119,87,${0.3+0.7*(age> (t-14)/(3.0)?0.9:1)})`:'#EFEBE0';
+      rrect(340+w*70,690+d*42,56,32,8);ctx.fill();
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // S7 engine panel
+  if(t>=17.0 && t<21.0){
+    const a=sceneOpacity(t,17,4.0);ctx.globalAlpha=a;
+    ctx.fillStyle=INK;rrect(0,0,1440,1440,0);ctx.fill();
+    txt('Rust 离线引擎',720,560,56,700,'#FAF9F5','center');
+    txt('165k 词 FST · 9 套输入方案 · 逐词译词 / CEFR',720,640,30,500,'#E8E6DC','center');
+    txt('全离线 · 零网络权限',720,700,30,500,CORAL,'center');
+    rrect(600,780,240,64,32);ctx.strokeStyle=CORAL;ctx.lineWidth=3;ctx.stroke();
+    txt('APK < 40MB',720,812,26,600,'#FAF9F5','center');
+    ctx.globalAlpha=1;
+  }
+
+  // S8 close
+  if(t>=21.0){
+    const a=win(t,21.0,21.3);ctx.globalAlpha=a;
+    txt('Typesake',720,660,82,800,INK,'center','Georgia,serif');
+    txt('打中文，记英语',720,750,32,500,CORAL,'center');
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+}
+window.seek=seek;
+</script></body></html>

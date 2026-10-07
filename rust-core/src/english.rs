@@ -872,7 +872,13 @@ fn en_words() -> Option<Arc<BTreeSet<String>>> {
 ///
 /// 缓冲（`prev`/`cur`）由调用方持有并复用：纠错时每个长度合适的候选都要算一次距离，
 /// 原来每次都现分配两个 `Vec`，8 万词表下等于每敲一个字母几万次分配。
-fn edit_within(a: &[u8], b: &[u8], max: u8, prev: &mut Vec<u16>, cur: &mut Vec<u16>) -> Option<u8> {
+fn edit_within<'a>(
+    a: &[u8],
+    b: &[u8],
+    max: u8,
+    prev: &'a mut Vec<u16>,
+    cur: &'a mut Vec<u16>,
+) -> Option<u8> {
     let n = b.len();
     prev.clear();
     prev.extend(0..=n as u16);
@@ -890,7 +896,8 @@ fn edit_within(a: &[u8], b: &[u8], max: u8, prev: &mut Vec<u16>, cur: &mut Vec<u
         if row_min > u16::from(max) {
             return None;
         }
-        std::mem::swap(&mut prev, &mut cur);
+        // 两个缓冲对调（不能 `&mut prev`：参数已经是引用了）
+        std::mem::swap(prev, cur);
     }
     let d = prev[n] as u8;
     (d <= max).then_some(d)

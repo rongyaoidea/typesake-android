@@ -152,7 +152,9 @@ class KeyboardView(
                 when {
                     // 字母键：大小写改写（id 恒为小写，取回小写字母再按当前状态写回）
                     id.startsWith(KEY_PREFIX_LETTER) && lower.length == 1 && lower[0].isLetter() ->
-                        key.setLetter(if (upper) lower.uppercaseChar() else lower.lowercaseChar())
+                        key.setLetter(
+                            if (upper) lower[0].uppercaseChar() else lower[0].lowercaseChar()
+                        )
                     // Shift 键自己也要换字面（⇧ / ⇪）
                     id == KEY_ID_SHIFT -> key.setLabel(shiftLabel)
                 }

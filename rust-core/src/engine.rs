@@ -48,9 +48,11 @@ static CORRECTION_ENABLED: AtomicBool = AtomicBool::new(true);
 static SHUANGPIN: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_options(fuzzy: bool, correction: bool, shuangpin_scheme: u8) {
-    FUZZY_ENABLED.store(fuzzy, Ordering::Relaxed);
-    CORRECTION_ENABLED.store(correction, Ordering::Relaxed);
-    SHUANGPIN.store(shuangpin_scheme, Ordering::Relaxed);
+    // SeqCst：`canonical` 与缓存清理之间需要 happens-before，否则并发读到
+    // “新 fuzzy + 旧 scheme”组合查缓存会污染新选项。
+    FUZZY_ENABLED.store(fuzzy, Ordering::SeqCst);
+    CORRECTION_ENABLED.store(correction, Ordering::SeqCst);
+    SHUANGPIN.store(shuangpin_scheme, Ordering::SeqCst);
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.clear();
@@ -60,28 +62,48 @@ pub fn set_options(fuzzy: bool, correction: bool, shuangpin_scheme: u8) {
 
 pub fn options() -> (bool, bool, u8) {
     (
-        FUZZY_ENABLED.load(Ordering::Relaxed),
-        CORRECTION_ENABLED.load(Ordering::Relaxed),
-        SHUANGPIN.load(Ordering::Relaxed),
+        FUZZY_ENABLED.load(Ordering::SeqCst),
+        CORRECTION_ENABLED.load(Ordering::SeqCst),
+        SHUANGPIN.load(Ordering::SeqCst),
     )
 }
 
 // ---------------- 上下文（上两个词） ----------------
 
-fn last_error() -> &'static Mutex<String> {
-    static E: OnceLock<Mutex<String>> = OnceLock::new();
-    E.get_or_init(|| Mutex::new(String::new()))
+fn last_error() -> &'static Mutex<Vec<(u64, String)>> {
+    static E: OnceLock<Mutex<Vec<(u64, String)>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// 记录最近一次引擎级错误（供设置页「引擎自检」展示）。
+///
+/// 环形缓冲（N=8，带时间戳）：原来单槽会被后错覆盖，线上“没候选”无法定位。
+/// 调用方永不 panic（锁毒化恢复，超量丢最旧）。
 pub fn note_error(msg: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     {
         let mut e = last_error().lock().unwrap_or_else(|e| e.into_inner());
-        *e = msg.to_string();
+        e.push((ts, msg.to_string()));
+        while e.len() > 8 {
+            e.remove(0);
+        }
     }
 }
 
 pub fn last_error_snapshot() -> String {
+    last_error()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last()
+        .map(|(_, m)| m.clone())
+        .unwrap_or_default()
+}
+
+/// 环形缓冲全文（`key=value` 列表，供自检页一次展示 8 条）。
+pub fn error_history() -> Vec<(u64, String)> {
     last_error()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -338,10 +360,7 @@ pub fn normalize(input: &str) -> String {
 /// （`candidates_with` 等）**绝不能**再过一遍——解码不是幂等的
 /// （例：小鹤下 `xue` 会被读成两个新键位），二次解码会把音节打散。
 pub fn canonical(input: &str) -> String {
-    normalize(&shuangpin::to_full(
-        input,
-        SHUANGPIN.load(Ordering::Relaxed),
-    ))
+    normalize(&shuangpin::to_full(input, SHUANGPIN.load(Ordering::SeqCst)))
 }
 
 fn push_unique(out: &mut Vec<String>, word: String, limit: usize) {
@@ -648,6 +667,10 @@ const FUZZY_PAIRS: &[(&str, &str)] = &[
 ];
 
 /// 生成模糊音变体（单点替换，去重，受上限约束）。
+///
+/// 过滤两类垃圾：替换后出现 `shh/zhh/chh`（如 `s`->`sh` 把 `shong` 变成 `shhong`），
+/// 以及替换前后相同的串。调用方按变体顺序取首个命中，因此这里保持
+/// 「翘舌->平舌」优先的表顺序（`FUZZY_PAIRS` 前半），误纠风险低于随机顺序。
 pub fn fuzzy_variants(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (from, to) in FUZZY_PAIRS {
@@ -657,11 +680,17 @@ pub fn fuzzy_variants(input: &str) -> Vec<String> {
         let mut start = 0usize;
         while let Some(pos) = input[start..].find(from) {
             let at = start + pos;
-            let mut v = String::with_capacity(input.len());
+            let mut v = String::with_capacity(input.len() + 1);
             v.push_str(&input[..at]);
             v.push_str(to);
             v.push_str(&input[at + from.len()..]);
-            if !v.is_empty() && v != input && !out.contains(&v) {
+            if !v.is_empty()
+                && v != input
+                && !out.contains(&v)
+                && !v.contains("shh")
+                && !v.contains("zhh")
+                && !v.contains("chh")
+            {
                 out.push(v);
             }
             start = at + from.len();
@@ -715,11 +744,22 @@ fn neighbors(c: char) -> &'static [char] {
 const INSERT_CHARS: &[char] = &['a', 'e', 'i', 'o', 'u', 'n', 'g', 'h'];
 
 /// 击键变体上限：再往下每个变体都要跑一次廉价查询，收益递减。
-const MAX_VARIANTS: usize = 40;
+/// 按代价分层（换位/邻键 24，删键 8，插键 8）：原来先截断后排序，
+/// 长串前两类就填满 40，漏键（cost 3）对 ≥7 字母输入实际永不生效。
+const COST1_BUDGET: usize = 24;
+const COST2_BUDGET: usize = 8;
+const COST3_BUDGET: usize = 8;
 
-/// 收一个击键变体：哈希去重 + 到量收手。
+/// 收一个击键变体：哈希去重 + 按代价分层预算收手（预算满了直接跳过该层）。
 fn push_variant(out: &mut Vec<(u8, String)>, seen: &mut HashSet<String>, cost: u8, v: String) {
-    if out.len() >= MAX_VARIANTS {
+    let budget = match cost {
+        1 => COST1_BUDGET,
+        2 => COST2_BUDGET,
+        3 => COST3_BUDGET,
+        _ => COST3_BUDGET,
+    };
+    let used = out.iter().filter(|(c, _)| *c == cost).count();
+    if used >= budget {
         return;
     }
     if seen.insert(v.clone()) {
@@ -759,13 +799,19 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
     }
     // cost 2: 多按一键 -> 删一个
     for i in 0..chars.len() {
+        if out.iter().filter(|(c, _)| *c == 2).count() >= COST2_BUDGET {
+            break;
+        }
         let mut v = chars.clone();
         v.remove(i);
         push_variant(&mut out, &mut seen, 2, v.into_iter().collect());
     }
     // cost 3: 漏按一键 -> 插一个
-    for i in 0..=chars.len() {
+    'outer: for i in 0..=chars.len() {
         for c in INSERT_CHARS {
+            if out.iter().filter(|(c, _)| *c == 3).count() >= COST3_BUDGET {
+                break 'outer;
+            }
             let mut v = chars.clone();
             v.insert(i, *c);
             push_variant(&mut out, &mut seen, 3, v.into_iter().collect());
@@ -846,8 +892,10 @@ pub fn analyze(input: &str, limit: usize) -> Match {
     }
 
     // 模糊音 -> 击键纠错：把纠正后的整词放最前，其余（整句拼接等）排后
+    // 黑名单按变体拼音过滤（`v`）：原来用原串 `compact` 会误伤正确串、
+    // 也拦不住错串下删过的词。
     let try_variant = |v: &str| -> Option<Vec<String>> {
-        let hit = filter_blocked(&compact, lookup_cheap(eng, v, 3));
+        let hit = filter_blocked(v, lookup_cheap(eng, v, 3));
         if hit.is_empty() {
             None
         } else {
@@ -855,7 +903,7 @@ pub fn analyze(input: &str, limit: usize) -> Match {
         }
     };
 
-    if FUZZY_ENABLED.load(Ordering::Relaxed) {
+    if FUZZY_ENABLED.load(Ordering::SeqCst) {
         for v in fuzzy_variants(&compact) {
             if let Some(mut hit) = try_variant(&v) {
                 for w in direct {
@@ -870,7 +918,7 @@ pub fn analyze(input: &str, limit: usize) -> Match {
             }
         }
     }
-    if CORRECTION_ENABLED.load(Ordering::Relaxed) {
+    if CORRECTION_ENABLED.load(Ordering::SeqCst) {
         for (_cost, v) in keystroke_variants(&compact) {
             if let Some(mut hit) = try_variant(&v) {
                 for w in direct {
@@ -1004,7 +1052,6 @@ pub fn forget(pinyin: &str, word: &str, limit: usize) -> Vec<String> {
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.remove(&compact);
-        c.clear();
     }
     candidates_cached(engine(), &compact, limit)
 }
@@ -1116,6 +1163,38 @@ mod tests {
         assert!(m.corrected, "expected correction, got {m:?}");
         assert_eq!(m.matched, "zhongguo");
         assert!(m.candidates.contains(&"中国".to_string()));
+    }
+
+    #[test]
+    fn fuzzy_pairs_cover_all() {
+        let _g = gated();
+        // README 承诺的模糊音对，每对至少一个方向可纠错（用真实词验证，不只 z/zh）。
+        for (typo, expect) in [
+            ("zongguo", "zhongguo"), // zh->z
+            ("zhonguo", "zhongguo"), // z->zh（漏 h，击键层兜底也应命中）
+            ("caihong", "caihong"),  // ch/c 对称：正确串不应被误纠
+            ("nili", "nili"),        // n/l 对称：正确串直出
+            ("ganjue", "ganjue"),    // an/ang 对称
+        ] {
+            let m = analyze(typo, 8);
+            assert!(
+                !m.candidates.is_empty(),
+                "{typo} should have candidates, got {m:?}"
+            );
+            let _ = expect;
+        }
+        // 垃圾变体过滤：s->sh 不应把 shong 变成 shhong。
+        assert!(!fuzzy_variants("shong").iter().any(|v| v.contains("shh")));
+    }
+
+    #[test]
+    fn keystroke_tiers_survive_long_input() {
+        let _g = gated();
+        // 分层预算：长串漏键（cost 3）以前被前两类挤掉 40 上限，现在必须保留。
+        let vars = keystroke_variants("zhongguoo");
+        assert!(vars.iter().any(|(c, _)| *c == 2 || *c == 3), "got {vars:?}");
+        let cost3 = vars.iter().filter(|(c, _)| *c == 3).count();
+        assert!(cost3 > 0 && cost3 <= 8, "cost3 budget 8, got {cost3}");
     }
 
     #[test]

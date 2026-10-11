@@ -21,7 +21,9 @@ import com.typesake.app.kb.KbThemes
 /** Anthropic 色板：暖米白 / 中灰 / 浅灰 + 陶土橙(主) / 尘蓝(次) / 鼠尾草绿(三级) */
 private val Cream = Color(0xFFFAF9F5)
 private val WarmInk = Color(0xFF33312E)
-private val WarmGray = Color(0xFFB0AEA5)
+/** 次要文字灰：与 KbTheme 的 LIGHT_HINT(0xFF5C5A52) 同值，保证 4.5:1 对比度闸门。
+ * 原来用的 0xFFB0AEA5 在浅色键帽上只有 1.78:1（KbThemeTest 点名），已对齐修复。 */
+private val WarmGray = Color(0xFF5C5A52)
 private val LightGray = Color(0xFFE8E6DC)
 private val Terracotta = Color(0xFFD97757)
 private val DustBlue = Color(0xFF6A9BCC)

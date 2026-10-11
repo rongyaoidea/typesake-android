@@ -21,6 +21,14 @@ pub struct Hit {
     pub kind: &'static str,
 }
 
+/// 输入长度上限：超出直接拒收。
+///
+/// 递归下降解析每层约 5 栈帧，`v((((...))))` 上万层括号会导致栈溢出（SIGSEGV，
+/// `catch_unwind` 抓不住）。128 字符足够一切手打算式，粘贴的超长串走 `None`。
+pub const MAX_SHORTCUT_LEN: usize = 128;
+/// 解析递归深度上限（括号/一元符号嵌套）。
+const MAX_DEPTH: usize = 32;
+
 /// 给定当前输入缓冲（原始串，未规整），若是快捷输入则返回展开结果。
 ///
 /// - 忽略首尾空白；
@@ -28,9 +36,12 @@ pub struct Hit {
 /// - 前缀最长优先：`im123` 走金额，而不是中文数字 `i123`。
 pub fn expand(raw: &str) -> Option<Hit> {
     let s = raw.trim();
-    if s.is_empty() {
+    if s.is_empty() || s.len() > MAX_SHORTCUT_LEN {
         return None;
     }
+    // 大小写不敏感：`V1+2` / `IM100` 与小写同义（与 `engine::canonical` 一致）。
+    let lower = s.to_ascii_lowercase();
+    let s = lower.as_str();
     // 最长前缀优先：先判 `im`，再按首字符分派其余前缀。
     if let Some(body) = s.strip_prefix("im") {
         return amount(body).map(|text| Hit {
@@ -85,11 +96,25 @@ enum IntErr {
 struct Parser {
     c: Vec<char>,
     p: usize,
+    depth: usize,
 }
 
 impl Parser {
     fn peek(&self) -> Option<char> {
         self.c.get(self.p).copied()
+    }
+
+    /// 进入一层嵌套（括号/一元）：超深直接 `None`，防栈溢出。
+    fn enter(&mut self) -> bool {
+        if self.depth >= MAX_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn expr(&mut self) -> Option<Node> {
@@ -142,11 +167,21 @@ impl Parser {
         match self.peek() {
             Some('+') => {
                 self.p += 1;
-                self.unary()
+                if !self.enter() {
+                    return None;
+                }
+                let r = self.unary();
+                self.leave();
+                r
             }
             Some('-') => {
                 self.p += 1;
-                Some(Node::Neg(Box::new(self.unary()?)))
+                if !self.enter() {
+                    return None;
+                }
+                let r = self.unary().map(|x| Node::Neg(Box::new(x)));
+                self.leave();
+                r
             }
             _ => self.pow(),
         }
@@ -157,8 +192,12 @@ impl Parser {
         let base = self.primary()?;
         if self.peek() == Some('^') {
             self.p += 1;
-            let e = self.unary()?;
-            Some(Node::Pow(Box::new(base), Box::new(e)))
+            if !self.enter() {
+                return None;
+            }
+            let e = self.unary();
+            self.leave();
+            Some(Node::Pow(Box::new(base), Box::new(e?)))
         } else {
             Some(base)
         }
@@ -169,7 +208,11 @@ impl Parser {
         match self.peek() {
             Some('(') => {
                 self.p += 1;
+                if !self.enter() {
+                    return None;
+                }
                 let n = self.expr()?;
+                self.leave();
                 if self.peek() == Some(')') {
                     self.p += 1;
                     Some(n)
@@ -359,9 +402,16 @@ fn calc(body: &str) -> Option<String> {
     if !cleaned.iter().any(|c| c.is_ascii_digit() || *c == '(') {
         return None;
     }
+    if cleaned.len() > MAX_SHORTCUT_LEN {
+        return None;
+    }
     // 整数模式：没有 `/` 也没有小数点。
     let float_mode = cleaned.iter().any(|c| *c == '/' || *c == '.');
-    let mut parser = Parser { c: cleaned, p: 0 };
+    let mut parser = Parser {
+        c: cleaned,
+        p: 0,
+        depth: 0,
+    };
     let ast = parser.expr()?;
     if parser.p != parser.c.len() {
         return None; // 残留非法串（如括号不匹配后多出来的字符）
@@ -661,8 +711,11 @@ fn codepoint(body: &str) -> Option<String> {
     } else {
         hex.parse::<u32>().ok()?
     };
-    // `char::from_u32` 一并拒绝超范围与 D800..DFFF 代理区。
+    // `char::from_u32` 一并拒绝超范围与 D800..DFFF 代理区；控制字符与私用区不直接上屏。
     let ch = char::from_u32(v)?;
+    if ch.is_control() {
+        return None;
+    }
     Some(ch.to_string())
 }
 
@@ -848,6 +901,22 @@ mod tests {
         assert_eq!(text("hello"), None);
         assert_eq!(text("123"), None);
         assert_eq!(text("="), None);
+    }
+
+    #[test]
+    fn guardrails_uppercase_long_control_depth() {
+        // 大小写不敏感：V/IM 与小写同义。
+        assert_eq!(text("V1+2").as_deref(), Some("3"));
+        assert_eq!(text("IM100").as_deref(), Some("壹佰元整"));
+        // 超长直接拒收（128 上限），不进解析器。
+        let long = format!("v{}", "1+".repeat(100));
+        assert_eq!(text(&long), None);
+        // 深括号超限拒收，不栈溢出。
+        let deep = format!("v{}", "(".repeat(40));
+        assert_eq!(text(&deep), None);
+        // 控制字符不上屏：u10（换行）/u0（NUL）必须 None。
+        assert_eq!(text("u10"), None);
+        assert_eq!(text("u0"), None);
     }
 
     #[test]

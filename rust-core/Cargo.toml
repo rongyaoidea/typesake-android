@@ -21,7 +21,7 @@ serde_json = "1"
 # Real Mandarin IME engine: 165k-entry FST dict, DP segmentation, Viterbi
 # composition, bigram next-word prediction, L0 user-learning layer.
 # trigrams (13.5MB) intentionally off to keep the .so small.
-inputx-pinyin = { version = "1.4", default-features = false, features = ["bigrams"] }
+inputx-pinyin = { version = "=1.4.0", default-features = false, features = ["bigrams"] }
 
 [profile.release]
 opt-level = "z"

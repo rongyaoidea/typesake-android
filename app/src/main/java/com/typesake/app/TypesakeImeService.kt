@@ -70,6 +70,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     /** CPU 密集的候选查询（analyze / more / t9），与文件 IO 互不拖累 */
     private val cpu = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var lookupJob: Job? = null
+    /** 后台回写序号：连点候选/快输时只让最新一次回写，旧任务结果丢弃。 */
+    private var commitSeq = 0L
 
     private val pinyin = StringBuilder()
     private val digitRun = StringBuilder()
@@ -93,6 +95,8 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private var lastShiftTap = 0L
     private var lastSpaceTap = 0L
     private var selfEdit = false
+    /** 自发编辑时间戳：批量回调（moveCursor DOWN+UP）200ms 内忽略，避免误清拼音。 */
+    private var selfEditAt = 0L
 
     private var kind = KbKind.QWERTY
     private var layer = KbLayer.LETTERS
@@ -243,6 +247,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         englishMode = KbLayouts.prefersEnglish(inputType)
         kind = KbLayouts.kindForInputType(inputType)
         privateField = KbLayouts.learningDisabled(inputType)
+        // 银行/笔记类应用的个性化学习总开关与无建议标记：视为隐私字段同等处理。
+        val noPersonalized = (info?.imeOptions
+            ?.and(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) ?: 0) != 0
+        val noSuggestions = (inputType and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0
+        if (noPersonalized || noSuggestions) privateField = true
         currentPkg = info?.packageName
         if (privateField) clearComposing()
     }
@@ -303,6 +312,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         unregisterClipboard()
         lookupJob?.cancel()
         dismissActionPopup()
+        // 切输入框时把旧编辑器的 composing 结束掉，否则旧框残留拼音下划线。
+        try {
+            currentInputConnection?.finishComposingText()
+        } catch (_: Exception) {
+        }
         if (::keyboard.isInitialized) keyboard.dismissAllPopups()
         super.onFinishInputView(finishingInput)
     }
@@ -424,6 +438,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         candidateRow.removeAllViews()
         applyBarBackground(candidatePane)
         composingInfo = ""   // 每帧重置，避免纠错提示残留
+        // 隐私字段：不读前文、不联想，直接 hint 返回（原来仍走 getTextBeforeCursor/域名分支）。
+        if (privateField) {
+            candidateRow.addView(textLabel("密码/隐私输入模式", colors.hint, colors.barBg))
+            return
+        }
         val vertical = prefs.verticalCandidates
         candidateRow.orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
         // 竖排一屏 4 条（+「更多/翻页」按钮），条得比横排高，否则末尾按钮全被裁掉。
@@ -1048,25 +1067,12 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     }
 
     /** 第一键后缀能不能坐实快捷输入形状（`im` 单独在 onLetter 里放行）。 */
-    private fun entersShortcut(prefix: Char, next: Char): Boolean = when (prefix) {
-        'v' -> next.isDigit() || next == '(' || next == '-' || next == '.'
-        'i' -> next.isDigit() || next == '-' || next == '.'
-        'u' -> next.isDigit()
-        else -> false
-    }
+    private fun entersShortcut(prefix: Char, next: Char): Boolean =
+        com.typesake.app.kb.InputRouter.entersShortcut(prefix, next)
 
     /** 整条缓冲是否仍然是某个快捷输入的合法前缀；不是就退出、交还给拼音。 */
-    private fun shortcutShapeOk(s: String): Boolean {
-        if (s.isEmpty() || s[0] !in "viu") return false
-        val rest = s.substring(1)
-        if (rest.isEmpty()) return true
-        return when (s[0]) {
-            'v' -> rest.all { it.isDigit() || it in "()+-*/.^%" }
-            'u' -> rest.all { it.isLetterOrDigit() }
-            else -> if (s.startsWith("im")) s.substring(2).all { it.isDigit() || it == '.' }
-            else rest.all { it.isDigit() || it == '-' || it == '.' }
-        }
-    }
+    private fun shortcutShapeOk(s: String): Boolean =
+        com.typesake.app.kb.InputRouter.shortcutShapeOk(s)
 
     private fun updateShortcut() {
         val hit = TypesakeCore.shortcutOf(scBuf.toString())
@@ -1109,16 +1115,17 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
      *   （主键区的 `.` 是句号键、这里当 ㄡ），符号页的 `，` `。` 仍是普通标点——
      *   否则注音模式下一个逗号都打不出来。
      */
-    private fun zhuyinInput(text: String): Boolean {
-        if (prefs.shuangpin != TypesakePrefs.SCHEME_ZHUYIN) return false
-        if (t9Mode || englishMode || privateField) return false
-        if (text.length != 1) return false
-        val ch = text[0]
-        if (ch.isDigit() || ch == '-') return true
-        if (ch !in ",.;:/") return false
-        if (pinyin.isNotEmpty()) return true
-        return layer == KbLayer.LETTERS
-    }
+    private fun zhuyinInput(text: String): Boolean =
+        com.typesake.app.kb.InputRouter.zhuyinInput(
+            text,
+            prefs.shuangpin,
+            TypesakePrefs.SCHEME_ZHUYIN,
+            t9Mode,
+            englishMode,
+            privateField,
+            pinyin.isNotEmpty(),
+            layer == KbLayer.LETTERS,
+        )
 
     // ---------------- 输入逻辑 ----------------
 
@@ -1379,6 +1386,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val typed = if (t9Mode) t9buf.toString() else pinyin.toString()
         val corrected = match?.corrected == true || match?.remembered == true
         val out = applyScript(word)
+        // 先结束 composing 再上屏：Chrome/Flutter/Compose TextField 否则留残 span 或双写。
+        try {
+            ic.finishComposingText()
+        } catch (_: Exception) {
+        }
         ic.commitText(out, 1)
         selfEdit = true
         resetPaging()
@@ -1402,6 +1414,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
      */
     private fun commitCandidateText(text: String) {
         val ic = currentInputConnection ?: return
+        try {
+            ic.finishComposingText()
+        } catch (_: Exception) {
+        }
         ic.commitText(text, 1)
         selfEdit = true
         resetPaging()
@@ -1419,6 +1435,10 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     /** 原样上屏（不做纠错/不学习），并清空组合状态。 */
     private fun commitRaw(text: String) {
         val ic = currentInputConnection ?: return
+        try {
+            ic.finishComposingText()
+        } catch (_: Exception) {
+        }
         ic.commitText(applyScript(text), 1)
         selfEdit = true
         pinyin.setLength(0)
@@ -1526,11 +1546,13 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         predictions = emptyList()
         refreshBars()
         io.launch { TypesakeCore.bump(LocalDate.now().toString()) }
+        val seq = ++commitSeq
         cpu.launch {
             val chips = TypesakeCore.englishList(word)
             val next = TypesakeCore.predict(word)
             prefetchGloss(next)
             withContext(Dispatchers.Main) {
+                if (seq != commitSeq) return@withContext
                 englishChips = chips
                 predictions = next
                 refreshBars()
@@ -1541,7 +1563,20 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     private fun commitDigitDecoration(text: String) {
         val ic = currentInputConnection ?: return
         if (digitRun.isNotEmpty()) {
-            ic.deleteSurroundingText(digitRun.length, 0)
+            // 删前校验光标前文一致（移光标后旧 digitRun 会删错字）：不一致则降级普通上屏。
+            val want = digitRun.toString()
+            val before = try {
+                ic.getTextBeforeCursor(want.length, 0)?.toString()
+            } catch (_: Exception) {
+                null
+            }
+            if (before == want) {
+                ic.deleteSurroundingText(want.length, 0)
+            }
+        }
+        try {
+            ic.finishComposingText()
+        } catch (_: Exception) {
         }
         ic.commitText(text, 1)
         digitRun.setLength(0)
@@ -1566,9 +1601,11 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val word = lastCommittedChinese
         englishChips = emptyList()
         refreshBars()
+        val seq = ++commitSeq
         cpu.launch {
             val chips = TypesakeCore.englishList(word)
             withContext(Dispatchers.Main) {
+                if (seq != commitSeq) return@withContext
                 englishChips = chips
                 refreshBars()
             }
@@ -1580,10 +1617,20 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
         val ic = currentInputConnection ?: return
         val cn = lastCommittedChinese
         if (cn.isNotEmpty() && cn != english) {
-            ic.deleteSurroundingText(cn.length, 0)
-            ic.commitText(english, 1)
-            lastCommittedChinese = english
-            toast("已改写为：$english")
+            // 按 UTF-16 长度删会错删 emoji/移光标后的字：先校验光标前文一致。
+            val before = try {
+                ic.getTextBeforeCursor(cn.length, 0)?.toString()
+            } catch (_: Exception) {
+                null
+            }
+            if (before == cn) {
+                ic.deleteSurroundingText(cn.length, 0)
+                ic.commitText(english, 1)
+                lastCommittedChinese = english
+                toast("已改写为：$english")
+            } else {
+                ic.commitText(english, 1)
+            }
         } else {
             ic.commitText(english, 1)
         }
@@ -1838,7 +1885,15 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
 
     private fun moveCursor(keyCode: Int) {
         val ic = currentInputConnection ?: return
-        if (pinyin.isNotEmpty()) commitTopCandidate()
+        // 空格滑移光标前先把各路 composing 定稿，否则快捷串/九键/英文残留在编辑器里。
+        if (scBuf.isNotEmpty()) commitShortcut()
+        else if (t9buf.isNotEmpty()) commitTopCandidate()
+        else if (enBuf.isNotEmpty()) commitEnglishWord()
+        else if (pinyin.isNotEmpty()) commitTopCandidate()
+        // 成对符号路径的 DOWN+UP 两次 selection 回调会被误判成手动移光标：
+        // 发键前后各记一次，`onUpdateSelection` 200ms 内忽略自发移动（见 selfEditAt）。
+        selfEdit = true
+        selfEditAt = SystemClock.uptimeMillis()
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
     }
@@ -1880,11 +1935,18 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     // ---------------- 剪贴板 ----------------
 
     private fun registerClipboard() {
-        if (!prefs.clipboardHistory || clipRegistered) return
+        // 密码/隐私框不监听剪贴板：密码管理器复制的密码会被自动收录并明文展示。
+        if (!prefs.clipboardHistory || clipRegistered || privateField) return
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         cm.addPrimaryClipChangedListener(clipListener)
         clipRegistered = true
-        captureClipboard()
+        // `coerceToText` 可能跨进程，丢到 IO 线程，回来只做 UI 赋值。
+        io.launch {
+            val text = captureOne()
+            if (text != null) {
+                withContext(Dispatchers.Main) { pushClip(text) }
+            }
+        }
     }
 
     private fun unregisterClipboard() {
@@ -1895,15 +1957,34 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
     }
 
     private fun captureClipboard() {
-        if (!prefs.clipboardHistory) return
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
-        val text = cm.primaryClip
-            ?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)
-            ?.coerceToText(this)
-            ?.toString()
-            ?.trim()
-        if (text.isNullOrEmpty() || text.length > 1000) return
+        if (!prefs.clipboardHistory || privateField) return
+        io.launch {
+            val text = captureOne()
+            if (text != null) {
+                withContext(Dispatchers.Main) { pushClip(text) }
+            }
+        }
+    }
+
+    /** 跨进程读一次剪贴板（IO 线程调用）。 */
+    private fun captureOne(): String? {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return null
+        val text = try {
+            cm.primaryClip
+                ?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)
+                ?.coerceToText(this)
+                ?.toString()
+                ?.trim()
+        } catch (_: Exception) {
+            null
+        }
+        if (text.isNullOrEmpty() || text.length > 1000) return null
+        return text
+    }
+
+    /** 主线程收录一条（去重 + 截断 + 刷新键盘剪贴板页）。 */
+    private fun pushClip(text: String) {
         clipItems.remove(text)
         clipItems.addFirst(text)
         while (clipItems.size > MAX_CLIP) clipItems.removeLast()
@@ -1929,15 +2010,27 @@ class TypesakeImeService : InputMethodService(), KeyboardView.Listener {
             candidatesEnd,
         )
         if (selfEdit) {
+            // 单比特挡不住批量回调：200ms 内的连续自发移动一并忽略。
+            if (SystemClock.uptimeMillis() - selfEditAt < 200) {
+                return
+            }
             selfEdit = false
             return
         }
-        if (pinyin.isNotEmpty() && (newSelStart != oldSelStart || newSelEnd != oldSelEnd)) {
-            pinyin.setLength(0)
-            candidates = emptyList()
-            match = null
-            currentInputConnection?.finishComposingText()
-            renderCandidates()
+        // 外来光标移动：全部缓冲（拼音/九键/快捷/英文/数字/翻页）都要清，
+        // 原来只清 pinyin，九键输一半点别处再按空格会把旧串在新光标上屏。
+        if (newSelStart != oldSelStart || newSelEnd != oldSelEnd) {
+            if (pinyin.isNotEmpty() || t9buf.isNotEmpty() || scBuf.isNotEmpty() ||
+                enBuf.isNotEmpty() || digitRun.isNotEmpty()
+            ) {
+                clearComposing()
+                try {
+                    currentInputConnection?.finishComposingText()
+                } catch (_: Exception) {
+                }
+                renderCandidates()
+                renderEnglish()
+            }
         }
     }
 

@@ -34,6 +34,15 @@
 - 许可：随上游仓库以 **MIT** 分发 <https://github.com/fxsjy/jieba/blob/master/LICENSE>
 - 署名：jieba（"结巴"中文分词）词表，作者 fxsjy 及贡献者。
 
+## OpenCC（简繁转换词表，生成 s2t.tsv / t2s.tsv）
+
+- 文件：`app/src/main/assets/s2t.tsv`（4.2 万条）、`app/src/main/assets/t2s.tsv`（3.6 千条），
+  由 `tools/gen_s2t_dict.py` 从 OpenCC 词典生成（见该脚本头注释）
+- 上游：<https://github.com/BYVoid/OpenCC>（BYVoid 及贡献者）
+- 许可：**Apache License 2.0** <https://www.apache.org/licenses/LICENSE-2.0>
+- 说明：多目标取首个；Rust 侧最长匹配（短语优先）。再分发本应用时请保留本文件与该署名，
+  APK 内另附 `assets/LICENSE_OPENCC.txt`（Apache-2.0 全文链接与本段摘要）。
+
 ## CEFR 词级分级表（生成 cefr.tsv）
 
 - 文件：`app/src/main/assets/cefr.tsv`（一行一条 `词<TAB>级别`，共 8690 条 A1..C2；可选产物，缺失时分级统计为空、逐词译词不标级别）

@@ -6,6 +6,9 @@
 //!   （US='\u{1E}' 字段分隔，GS='\u{1F}' 列表分隔，省掉每键 JSON 解析）
 //! - 冷路径（收藏/统计/初始化）返回 JSON；
 //! - **所有导出函数都经 [`guarded`] 包裹**：Rust panic 不跨 FFI，最坏返回空串。
+//! - 入参转换 [`jstr_to_rust`] 与出参转换 [`rust_to_jstr`] 自身永不 panic
+//!  （null 入参/pending exception/OOM 全降级为空串或 null JString），
+//!   因此在 `guarded` 之外调用也是安全的。
 
 use crate::{engine, english, store};
 use jni::objects::{JClass, JString};
@@ -13,17 +16,48 @@ use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
 
 pub const FIELD: char = '\u{1E}';
+/// 字段分隔（US），与 [`crate::DELIM`]（GS='\u{1F}' 列表分隔）配对。
+/// 跨语言协议见 `docs/proto.md`：US=字段，GS=列表，RS='\u{1D}'=子字段。
+pub const UNIT_SEP: char = '\u{1E}';
+/// 列表分隔（GS），与 [`crate::DELIM_STR`] 同值。此处保留 `ITEM` 别名仅为兼容旧名，
+/// 新代码请用 `crate::DELIM` / `crate::DELIM_STR`。
 pub const ITEM: char = '\u{1F}';
+/// 子字段分隔（RS）：`拼音<RS>词`、`kind<RS>text` 等都用它。
+pub const REC_SEP: char = '\u{1D}';
 
+/// JNI 入参 -> Rust String（永不 panic，供 FFI 边界外调用）。
+///
+/// - null 入参 -> 空串；
+/// - JVM 已有 pending exception -> 空串（不清异常，让调用方决定）；
+/// - `get_string` / `to_str` 失败 -> 空串（不 `unwrap` / `expect`）。
 fn jstr_to_rust(env: &mut JNIEnv, s: &JString) -> String {
+    use jni::objects::JObject;
+    if s.is_null() {
+        return String::new();
+    }
+    // JString derefs to JObject；is_null 上面已查。这里再防一次 pending exception。
+    if env.exception_check().unwrap_or(true) {
+        return String::new();
+    }
     env.get_string(s)
         .map(|j| j.to_str().unwrap_or_default().to_owned())
         .unwrap_or_default()
 }
 
+/// Rust String -> JNI String（永不 panic）。
+///
+/// `new_string` 失败（OOM / pending exception）时退回空串；
+/// 空串也建不出来时返回 null JString（Kotlin 侧按空串处理），绝不 `expect` 跨 FFI。
 fn rust_to_jstr<'local>(env: &mut JNIEnv<'local>, s: &str) -> JString<'local> {
-    env.new_string(s)
-        .unwrap_or_else(|_| env.new_string("").expect("empty JString must succeed"))
+    if let Ok(v) = env.new_string(s) {
+        return v;
+    }
+    // 记录一次，供引擎自检可见（note_error 自身永不 panic）。
+    crate::engine::note_error("JNI new_string 失败，已降级为空串");
+    if let Ok(v) = env.new_string("") {
+        return v;
+    }
+    JString::from(jni::objects::JObject::null())
 }
 
 fn guarded<F: FnOnce() -> String>(f: F) -> String {
@@ -193,6 +227,10 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_setEngineOptions<'loca
 ) -> JString<'local> {
     let scheme = u8::try_from(shuangpin).unwrap_or(0);
     let plan = u8::try_from(script).unwrap_or(0);
+    // 越界方案静默变全拼会写盘污染设置：直接报错，由设置页提示。
+    if scheme > 8 || plan > 1 {
+        return rust_to_jstr(&mut env, &err_json("非法的输入方案或字形参数"));
+    }
     let out = guarded(
         || match store::set_settings(fuzzy != 0, correction != 0, scheme, plan) {
             Ok(()) => ok_json("\"saved\":1"),
@@ -211,7 +249,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_blockedWords<'local>(
     let out = guarded(|| {
         let items: Vec<String> = engine::blocked_words()
             .into_iter()
-            .map(|(p, w)| format!("{p}\u{1D}{w}"))
+            .map(|(p, w)| format!("{p}{REC_SEP}{w}"))
             .collect();
         join(&items)
     });
@@ -351,7 +389,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_flushStorage<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    let out = guarded(|| match store::persist() {
+    let out = guarded(|| match store::persist_forced() {
         Ok(()) => ok_json("\"saved\":1"),
         Err(e) => err_json(&e),
     });
@@ -367,7 +405,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_learnedWords<'local>(
     let out = guarded(|| {
         let items: Vec<String> = engine::learned_words()
             .into_iter()
-            .map(|(p, w, c)| format!("{p}\u{1D}{w}\u{1D}{c}"))
+            .map(|(p, w, c)| format!("{p}{REC_SEP}{w}{REC_SEP}{c}"))
             .collect();
         join(&items)
     });
@@ -388,13 +426,17 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_clearLearned<'local>(
     rust_to_jstr(&mut env, &out)
 }
 
-/// 本地备份：导出整库 JSON。
+/// 本地备份：导出整库 JSON。失败返回 `err_json`（调用方必须提示用户），
+/// 绝不伪装成空备份覆盖用户手里的旧文件。
 #[no_mangle]
 pub extern "system" fn Java_com_typesake_app_TypesakeCore_exportBackup<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    let out = guarded(|| store::export_json().unwrap_or_default());
+    let out = guarded(|| match store::export_json() {
+        Ok(s) => s,
+        Err(e) => err_json(&e),
+    });
     rust_to_jstr(&mut env, &out)
 }
 
@@ -437,7 +479,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_userWords<'local>(
     let out = guarded(|| {
         let items: Vec<String> = store::user_words()
             .into_iter()
-            .map(|(p, w)| format!("{p}\u{1D}{w}"))
+            .map(|(p, w)| format!("{p}{REC_SEP}{w}"))
             .collect();
         join(&items)
     });
@@ -477,7 +519,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_mailDomains<'local>(
     let out = guarded(|| {
         let items: Vec<String> = store::mail_domains()
             .into_iter()
-            .map(|(d, c)| format!("{d}\u{1D}{c}"))
+            .map(|(d, c)| format!("{d}{REC_SEP}{c}"))
             .collect();
         join(&items)
     });
@@ -542,7 +584,7 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_englishCandidates<'loc
     let out = guarded(|| {
         let items: Vec<String> = english::english_candidates(&s)
             .into_iter()
-            .map(|(kind, text)| format!("{kind}\u{1D}{text}"))
+            .map(|(kind, text)| format!("{kind}{REC_SEP}{text}"))
             .collect();
         join(&items)
     });
@@ -777,6 +819,27 @@ pub extern "system" fn Java_com_typesake_app_TypesakeCore_setFeatureOptions<'loc
             }
             Err(e) => err_json(&e),
         }
+    });
+    rust_to_jstr(&mut env, &out)
+}
+
+/// 错误历史（环形 8 条）：`[{"t":ts,"m":"msg"},…]`，供设置页「引擎自检」一次展示。
+#[no_mangle]
+pub extern "system" fn Java_com_typesake_app_TypesakeCore_errorHistory<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let out = guarded(|| {
+        let items: Vec<String> = engine::error_history()
+            .into_iter()
+            .map(|(t, m)| {
+                format!(
+                    "{{\"t\":{t},\"m\":{}}}",
+                    serde_json::to_string(&m).unwrap_or_else(|_| "\"\"".to_string())
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
     });
     rust_to_jstr(&mut env, &out)
 }

@@ -14,7 +14,8 @@ class TypesakePrefs(context: Context) {
 
     /** 按键高度（dp），影响整个键盘高度 */
     var keyHeightDp: Int
-        get() = sp.getInt(KEY_KEY_HEIGHT, 46)
+        // getter 也 coerce：旧越界值（如 100）直传 Slider(34..62) 会崩设置页。
+        get() = sp.getInt(KEY_KEY_HEIGHT, 46).coerceIn(MIN_KEY_HEIGHT, MAX_KEY_HEIGHT)
         set(v) = sp.edit().putInt(KEY_KEY_HEIGHT, v.coerceIn(MIN_KEY_HEIGHT, MAX_KEY_HEIGHT)).apply()
 
     var haptics: Boolean

@@ -35,13 +35,16 @@ fn u32_at(d: &[u8], p: usize) -> u32 {
 }
 
 /// 从内存载入（便于测试）。
+///
+/// 对不可信文件逐条校验 `(off,len)`：任一条越界 / 索引越界即拒装（返回 0），
+/// 避免之后每次 `exact/prefix` 在 [`Lex::key`] 切片时 panic（持久 DoS）。
 pub fn load_bytes(data: Vec<u8>) -> usize {
     if data.len() < HEADER || &data[0..4] != MAGIC {
         return 0;
     }
     let count = u32_at(&data, 8) as usize;
-    let index_end = HEADER + count * REC;
-    if index_end > data.len() {
+    let index_end = HEADER.saturating_add(count.saturating_mul(REC));
+    if index_end > data.len() || index_end < HEADER {
         return 0;
     }
     // 两个 blob 的起点：键区紧接索引，值区起点 = 键区末尾（由记录里的最大 key_off+len 推导）
@@ -51,10 +54,26 @@ pub fn load_bytes(data: Vec<u8>) -> usize {
         let p = HEADER + i * REC;
         let off = u32_at(&data, p) as usize;
         let len = u16_at(&data, p + 8) as usize;
-        key_end = key_end.max(key_base + off + len);
+        key_end = key_end.max(key_base.saturating_add(off).saturating_add(len));
     }
     if key_end > data.len() {
         return 0;
+    }
+    let val_base = key_end;
+    // 逐条校验：key 落在键区内，val 落在文件内（含 UTF-8 由调用方懒校验）。
+    for i in 0..count {
+        let p = HEADER + i * REC;
+        let k_off = u32_at(&data, p) as usize;
+        let k_len = u16_at(&data, p + 8) as usize;
+        let v_off = u32_at(&data, p + 4) as usize;
+        let v_len = u16_at(&data, p + 10) as usize;
+        let ks = key_base.saturating_add(k_off);
+        let ke = ks.saturating_add(k_len);
+        let vs = val_base.saturating_add(v_off);
+        let ve = vs.saturating_add(v_len);
+        if ke > key_end || vs < val_base || ve > data.len() || ke < ks || ve < vs {
+            return 0;
+        }
     }
     let lex = Lex {
         val_base: key_end,
@@ -85,10 +104,11 @@ pub fn size() -> usize {
 impl Lex {
     fn key(&self, i: usize) -> &[u8] {
         let p = HEADER + i * REC;
+        // load 时已逐条校验，这里用 `get` 兜底：坏数据最多 miss，绝不 panic。
         let off = u32_at(&self.data, p) as usize;
         let len = u16_at(&self.data, p + 8) as usize;
-        let s = self.key_base + off;
-        &self.data[s..s + len]
+        let s = self.key_base.saturating_add(off);
+        self.data.get(s..s.saturating_add(len)).unwrap_or(&[])
     }
 
     fn val(&self, i: usize) -> Option<&str> {

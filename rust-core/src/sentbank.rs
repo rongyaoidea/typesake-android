@@ -49,47 +49,84 @@ pub fn load_bytes(data: Vec<u8>) -> usize {
     }
     let sent_count = u32_at(&data, 8) as usize;
     let gram_count = u32_at(&data, 12) as usize;
+    // 先确认每张表的区间都在缓冲区内，再做长度扫描（顺序不能反：坏 count 会导致
+    // 扫描循环直接下标 panic 或数十亿次空转）。
+    // 拒绝超大 count（防 `count * REC` 溢出后绕过检查，以及 postings 巨额分配）。
+    if sent_count > 1_000_000 || gram_count > 500_000 {
+        return 0;
+    }
     let sent_idx = HEADER;
-    let gram_idx = sent_idx + sent_count * SENT_REC;
-    let postings = gram_idx + gram_count * GRAM_REC;
-    let postings_len = gram_count * MAX_POSTINGS_PER_GRAM * 4;
-    let zh_blob = postings + postings_len;
+    let gram_idx = sent_idx.saturating_add(sent_count.saturating_mul(SENT_REC));
+    let postings = gram_idx.saturating_add(gram_count.saturating_mul(GRAM_REC));
+    let postings_len = gram_count
+        .saturating_mul(MAX_POSTINGS_PER_GRAM)
+        .saturating_mul(4);
+    let zh_blob = postings.saturating_add(postings_len);
+    if sent_idx > data.len()
+        || gram_idx > data.len()
+        || postings > data.len()
+        || zh_blob > data.len()
+    {
+        return 0;
+    }
+    if postings_len > data.len() || zh_blob < postings {
+        return 0;
+    }
+    // 安全读索引区（越界返回 0，不 panic），用于推导 blob 长度。
+    let u32_safe = |p: usize| -> usize {
+        if p.saturating_add(4) > data.len() {
+            return 0;
+        }
+        u32_at(&data, p) as usize
+    };
+    let u16_safe = |p: usize| -> usize {
+        if p.saturating_add(2) > data.len() {
+            return 0;
+        }
+        u16_at(&data, p) as usize
+    };
     // zh_blob 长度由 sent_idx 推得
     let mut zh_len = 0usize;
     for i in 0..sent_count {
-        let p = sent_idx + i * SENT_REC;
-        zh_len = zh_len.max(u32_at(&data, p) as usize + u16_at(&data, p + 4) as usize);
+        let p = sent_idx.saturating_add(i.saturating_mul(SENT_REC));
+        if p.saturating_add(SENT_REC) > data.len() {
+            return 0;
+        }
+        zh_len = zh_len.max(u32_safe(p).saturating_add(u16_safe(p + 4)));
     }
-    let en_blob = zh_blob + zh_len;
-    let mut en_len = 0usize;
-    for i in 0..sent_count {
-        let p = sent_idx + i * SENT_REC;
-        en_len = en_len.max(u32_at(&data, p + 6) as usize + u16_at(&data, p + 10) as usize);
-    }
-    let gram_blob = en_blob + en_len;
-    let mut g_len = 0usize;
-    for i in 0..gram_count {
-        let p = gram_idx + i * GRAM_REC;
-        g_len = g_len.max(u32_at(&data, p) as usize + u16_at(&data, p + 4) as usize);
-    }
-    if gram_blob + g_len > data.len() {
+    let en_blob = zh_blob.saturating_add(zh_len);
+    if en_blob > data.len() {
         return 0;
     }
-    // 上面三轮长度扫描都按索引读 `data`（u16_at/u32_at 是直接下标），
-    // 文件被截断就会 panic —— 这个函数从 FFI 的 initStorage/importBackup 能走到，
-    // 必须先确认每张表的区间都在缓冲区内（biglex.rs / gramidx.rs 也是这么守的）。
+    let mut en_len = 0usize;
+    for i in 0..sent_count {
+        let p = sent_idx.saturating_add(i.saturating_mul(SENT_REC));
+        if p.saturating_add(SENT_REC) > data.len() {
+            return 0;
+        }
+        en_len = en_len.max(u32_safe(p + 6).saturating_add(u16_safe(p + 10)));
+    }
+    let gram_blob = en_blob.saturating_add(en_len);
+    if gram_blob > data.len() {
+        return 0;
+    }
+    let mut g_len = 0usize;
+    for i in 0..gram_count {
+        let p = gram_idx.saturating_add(i.saturating_mul(GRAM_REC));
+        if p.saturating_add(GRAM_REC) > data.len() {
+            return 0;
+        }
+        g_len = g_len.max(u32_safe(p).saturating_add(u16_safe(p + 4)));
+    }
+    // 三轮扫描已用安全读完成；这里做最终区间交叉校验。
     let zh_end = zh_blob.saturating_add(zh_len);
     let en_end = en_blob.saturating_add(en_len);
     let gram_end = gram_blob.saturating_add(g_len);
-    if sent_idx.saturating_add(sent_count.saturating_mul(SENT_REC)) > data.len()
-        || gram_idx.saturating_add(gram_count.saturating_mul(GRAM_REC)) > data.len()
-        || postings.saturating_add(postings_len) > data.len()
-        || zh_blob > data.len()
-        || zh_end > en_blob
-        || en_blob > data.len()
+    if zh_end > en_blob
         || en_end > gram_blob
-        || gram_blob > data.len()
         || gram_end > data.len()
+        || zh_end > data.len()
+        || en_end > data.len()
     {
         return 0;
     }

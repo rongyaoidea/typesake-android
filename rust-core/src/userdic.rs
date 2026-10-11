@@ -47,12 +47,20 @@ pub fn name_to_pinyin(name: &str) -> Option<String> {
 }
 
 /// 解析粘贴文本里的姓名（换行/逗号/分号/顿号/空格分隔）。
+///
+/// 过滤协议分隔符（US/GS/RS）与其它控制字符：否则粘贴串可注入分隔符破坏
+/// Kotlin 侧解析（`TypesakeCore.splitDelim` 会被切散）。
 pub fn parse_names(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for piece in
         text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；' | '、'))
     {
-        let name = piece.trim();
+        let cleaned: String = piece
+            .trim()
+            .chars()
+            .filter(|c| *c != '\u{1E}' && *c != '\u{1F}' && *c != '\u{1D}' && !c.is_control())
+            .collect();
+        let name = cleaned.trim();
         if name.chars().count() < 2 || name.chars().count() > 6 {
             continue;
         }
@@ -79,10 +87,18 @@ pub fn set_domains(items: Vec<(String, u32)>) {
 
 pub fn remember_domain(domain: &str) -> Vec<(String, u32)> {
     let d = domain.trim().to_ascii_lowercase();
-    let mut out = Vec::new();
-    if d.is_empty() {
-        return out;
+    // 域名限长 64：防超长串进快照撑大 DB。
+    if d.is_empty() || d.len() > 64 {
+        return domains_snapshot();
     }
+    // 域名只允许常规字符，其余直接拒绝（防分隔符注入）。
+    if !d
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return domains_snapshot();
+    }
+    let mut out = Vec::new();
     {
         let mut list = domains().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = list.iter_mut().find(|(x, _)| *x == d) {
@@ -120,6 +136,21 @@ mod tests {
                 "赵六".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn separators_and_control_are_filtered() {
+        // 分隔符注入：粘贴含 US/GS/RS 与控制字符不得进名单。
+        let names = parse_names("张三\u{1E}李四\n王\u{1F}五\u{0}");
+        assert!(!names.iter().any(|n| n.contains('\u{1E}')));
+        assert!(!names.iter().any(|n| n.contains('\u{1F}')));
+        // 域名限长与字符白名单。
+        set_domains(Vec::new());
+        remember_domain(&"a".repeat(100));
+        assert!(domains_snapshot().is_empty());
+        remember_domain("gmail.com");
+        assert_eq!(domains_snapshot().len(), 1);
+        set_domains(Vec::new());
     }
 
     #[test]

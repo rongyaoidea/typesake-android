@@ -256,7 +256,6 @@ const WORDS: &[(&str, &str)] = &[
     ("做", "do"),
     ("去", "go"),
     ("来", "come"),
-    ("去2", "go"),
     ("看", "look"),
     ("看到", "see"),
     ("听", "listen"),
@@ -661,14 +660,12 @@ const TIME_WORDS: &[(&str, &str)] = &[
     ("昨天", "yesterday"),
     ("现在", "right now"),
     ("每天", "every day"),
-    ("每天2", "every day"),
     ("马上", "right away"),
     ("等会儿", "in a while"),
     ("以后", "later"),
     ("周末", "this weekend"),
     ("这周", "this week"),
     ("下周", "next week"),
-    ("下周2", "next week"),
     ("上周", "last week"),
     ("今年", "this year"),
     ("明年", "next year"),
@@ -824,14 +821,25 @@ pub(crate) fn dict_lookup(zh: &str) -> Option<String> {
     dict_exact(zh)
 }
 
+/// 大词典快照（逐词译词批量查用）：整次切词只锁一次，调用方复用。
+/// 10 万条 clone 约数 MB，gloss 是按候选缓存的（192 条），均摊可接受；
+/// 不做 Arc 共享是为避免大词典热替换时的生命周期复杂度。
+pub(crate) fn big_dict_snapshot() -> HashMap<String, String> {
+    big_dict().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 // ---------------- 英文模式拼写纠正 ----------------
 
 /// 英文单词表的存储格（从大词典的英文侧收集；**首次用到才建**，不用的人不占这份内存）。
-///
-/// 放 `Arc` 是因为纠正在每次敲键都要查：锁只负责「第一次建表」，之后拿到的是共享句柄，
-/// 不用每敲一个字母就克隆 8 万条字符串。
-fn en_cell() -> &'static RwLock<Option<Arc<BTreeSet<String>>>> {
-    static W: OnceLock<RwLock<Option<Arc<BTreeSet<String>>>>> = OnceLock::new();
+/// 英文词表：精确判存用 `set`，纠错扫描只走 `buckets[len±budget]`。
+/// 原来每键全表 8 万扫描 + 每次 DP，低端机必掉帧。
+struct EnWords {
+    set: std::collections::BTreeSet<String>,
+    buckets: std::collections::HashMap<usize, Vec<String>>,
+}
+
+fn en_cell() -> &'static RwLock<Option<Arc<EnWords>>> {
+    static W: OnceLock<RwLock<Option<Arc<EnWords>>>> = OnceLock::new();
     W.get_or_init(|| RwLock::new(None))
 }
 
@@ -841,7 +849,7 @@ fn reset_en_words() {
 }
 
 /// 取英文词表；没有可取的（词典未载入）返回 `None`。
-fn en_words() -> Option<Arc<BTreeSet<String>>> {
+fn en_words() -> Option<Arc<EnWords>> {
     let cell = en_cell();
     // 快路径：只读锁拿到就返回（每敲一个字母都会走这里，原来每次都拿写锁）。
     // 先把结果落到一个局部变量再判断，读锁在这一行结束就释放，不会和下面的写锁死锁。
@@ -849,23 +857,38 @@ fn en_words() -> Option<Arc<BTreeSet<String>>> {
     if cached.is_some() {
         return cached;
     }
-    let mut g = cell.write().unwrap_or_else(|e| e.into_inner());
-    if g.is_none() {
-        let mut set = BTreeSet::new();
-        {
-            let m = big_dict().lock().unwrap_or_else(|e| e.into_inner());
-            for v in m.values() {
-                for tok in v.split(|c: char| !c.is_ascii_alphabetic()) {
-                    let t = tok.to_ascii_lowercase();
-                    if (2..=24).contains(&t.len()) {
-                        set.insert(t);
-                    }
+    // 锁外构建 8 万词表（原来占着写锁 token 化，并发纠错全堵）。
+    let mut set = std::collections::BTreeSet::new();
+    {
+        let m = big_dict().lock().unwrap_or_else(|e| e.into_inner());
+        for v in m.values() {
+            for tok in v.split(|c: char| !c.is_ascii_alphabetic()) {
+                let t = tok.to_ascii_lowercase();
+                if (2..=24).contains(&t.len()) {
+                    set.insert(t);
                 }
             }
         }
-        *g = Some(Arc::new(set));
     }
-    g.clone()
+    if set.is_empty() {
+        return None;
+    }
+    let mut buckets: std::collections::HashMap<usize, Vec<String>> =
+        std::collections::HashMap::new();
+    for w in &set {
+        buckets.entry(w.len()).or_default().push(w.clone());
+    }
+    let arc = Arc::new(EnWords { set, buckets });
+    {
+        let mut g = cell.write().unwrap_or_else(|e| e.into_inner());
+        // 双重检查：并发进来时可能已被建好，直接复用。
+        if g.is_none() {
+            *g = Some(arc.clone());
+        } else {
+            return g.clone();
+        }
+    }
+    Some(arc)
 }
 
 /// 有界编辑距离：距离超过 `max` 直接放弃（返回 `None`），省掉剩下的一大片 DP。
@@ -917,33 +940,33 @@ pub fn fix_spelling(word: &str) -> Option<String> {
     if w.len() < 3 || w.len() > 24 || !w.bytes().all(|b| b.is_ascii_alphabetic()) {
         return None;
     }
-    let set = en_words()?;
-    if set.is_empty() || set.contains(&w) {
+    let table = en_words()?;
+    if table.set.is_empty() || table.set.contains(&w) {
         return None;
     }
     let budget: u8 = if w.len() <= 4 { 1 } else { 2 };
-    let lo = w.len() - budget as usize;
-    let hi = w.len() + budget as usize;
     let (ab, wb) = (w.as_bytes(), w.as_bytes());
     let mut prev: Vec<u16> = Vec::new();
     let mut cur: Vec<u16> = Vec::new();
     let mut best: Option<((u8, u8, u8), String)> = None;
-    for cand in set.iter() {
-        let cl = cand.len();
-        if cl < lo || cl > hi {
-            continue;
-        }
-        let Some(d) = edit_within(wb, cand.as_bytes(), budget, &mut prev, &mut cur) else {
+    // 只扫长度 ±budget 桶（原来全表 8 万扫描）。
+    for len in w.len().saturating_sub(budget as usize)..=w.len() + budget as usize {
+        let Some(bucket) = table.buckets.get(&len) else {
             continue;
         };
-        let key = (
-            d,
-            u8::from(cand.as_bytes()[0] != ab[0]),
-            cl.abs_diff(w.len()).min(255) as u8,
-        );
-        // 严格小于：BTreeSet 是字典序遍历，平手时自然留下字典序靠前的那个
-        if best.as_ref().map(|(bk, _)| key < *bk).unwrap_or(true) {
-            best = Some((key, cand.clone()));
+        for cand in bucket {
+            let Some(d) = edit_within(wb, cand.as_bytes(), budget, &mut prev, &mut cur) else {
+                continue;
+            };
+            let key = (
+                d,
+                u8::from(cand.as_bytes()[0] != ab[0]),
+                len.abs_diff(w.len()).min(255) as u8,
+            );
+            // 严格小于：桶内是字典序插入，平手时自然留下字典序靠前的那个
+            if best.as_ref().map(|(bk, _)| key < *bk).unwrap_or(true) {
+                best = Some((key, cand.clone()));
+            }
         }
     }
     best.map(|(_, c)| c)
@@ -970,7 +993,14 @@ fn is_vowel(c: char) -> bool {
 }
 
 /// 动词 -> -ing（go→going / run→running / make→making / lie→lying）。
+///
+/// CVC 双写仅限短词/单音节：多音节词（open/listen/visit…）不双写，
+/// 否则 `open` 会错成 `openning`。这里用例外表 + 长度启发（教学简化，非完整音节库）。
 pub fn verb_ing(v: &str) -> String {
+    const NO_DOUBLE: &[&str] = &[
+        "open", "listen", "visit", "happen", "remember", "offer", "order", "enter", "answer",
+        "cover", "gather", "suffer", "listen", "target", "market", "profit",
+    ];
     let w = v.trim();
     if w.is_empty() {
         return w.to_string();
@@ -981,9 +1011,14 @@ pub fn verb_ing(v: &str) -> String {
     if w.ends_with('e') && !w.ends_with("ee") && !w.ends_with("ye") {
         return format!("{}ing", &w[..w.len() - 1]);
     }
+    let lower = w.to_ascii_lowercase();
+    if NO_DOUBLE.contains(&lower.as_str()) {
+        return format!("{w}ing");
+    }
     let chars: Vec<char> = w.chars().collect();
     let n = chars.len();
-    if n >= 3 {
+    // 长度 >5 的多音节词默认不双写（begin/commit 这类真双写的走不规则/常用表，宁可少双写不错双写）。
+    if n >= 3 && n <= 5 {
         let (a, b, c) = (chars[n - 3], chars[n - 2], chars[n - 1]);
         if !is_vowel(a) && is_vowel(b) && !is_vowel(c) && c != 'w' && c != 'x' && c != 'y' {
             return format!("{w}{c}ing");
@@ -1014,7 +1049,7 @@ pub fn verb_past(v: &str) -> String {
     }
     let chars: Vec<char> = w.chars().collect();
     let n = chars.len();
-    if n >= 3 {
+    if n >= 3 && n <= 5 {
         let (a, b, c) = (chars[n - 3], chars[n - 2], chars[n - 1]);
         if !is_vowel(a) && is_vowel(b) && !is_vowel(c) && !"wxhy".contains(c) {
             return format!("{w}{c}ed");
@@ -1024,7 +1059,12 @@ pub fn verb_past(v: &str) -> String {
 }
 
 /// 动词 -> 第三人称单数。
+///
+/// `o` 结尾默认 +s（photo→photos），只有 go/do/potato 等少数 +es（教学简化表）。
 pub fn verb_s(v: &str) -> String {
+    const O_ES: &[&str] = &[
+        "go", "do", "potato", "tomato", "hero", "echo", "veto", "torpedo",
+    ];
     let w = v.trim();
     if w.is_empty() {
         return w.to_string();
@@ -1036,7 +1076,7 @@ pub fn verb_s(v: &str) -> String {
         || w.ends_with('x')
         || w.ends_with("ch")
         || w.ends_with("sh")
-        || w.ends_with('o')
+        || (w.ends_with('o') && O_ES.contains(&w.to_ascii_lowercase().as_str()))
     {
         return format!("{w}es");
     }
@@ -1071,17 +1111,24 @@ pub fn plural(n: &str) -> String {
     format!("{w}s")
 }
 
-/// 冠词：按发音决定 a / an（只处理常见元音开头）。
+/// 冠词：按发音决定 a / an（只处理常见元音开头 + h 哑音小表 + u 发 /juː/ 例外）。
 pub fn article(noun: &str) -> String {
-    let first = noun
-        .trim()
-        .chars()
-        .next()
-        .unwrap_or('x')
-        .to_ascii_lowercase();
+    let lower = noun.trim().to_ascii_lowercase();
+    let first = lower.chars().next().unwrap_or('x');
+    // h 哑音：hour/honest/honor/heir 发元音，用 an（教学简化表）。
+    if ["hour", "honest", "honor", "honour", "heir", "herb"]
+        .iter()
+        .any(|w| lower == *w || lower.starts_with(&format!("{w} ")))
+    {
+        return format!("an {noun}");
+    }
+    // one/one-off 发 /w/，用 a。
+    if lower == "one" || lower.starts_with("one ") || lower.starts_with("one-") {
+        return format!("a {noun}");
+    }
     let an = matches!(first, 'a' | 'e' | 'i' | 'o' | 'u')
-        && !noun.trim().to_ascii_lowercase().starts_with("uni")
-        && !noun.trim().to_ascii_lowercase().starts_with("use");
+        && !lower.starts_with("uni")
+        && !lower.starts_with("use");
     if an {
         format!("an {noun}")
     } else {
@@ -1477,8 +1524,9 @@ pub fn try_patterns(text: &str) -> Option<String> {
         if let Some(v) = slot(rest) {
             let words: Vec<&str> = v.split_whitespace().collect();
             if words.len() >= 2 {
+                // `slot` 返回前做了 `lower_first`（"I"→"i"），这里必须大小写不敏感。
                 let subject = words[0];
-                if subject == "I"
+                if subject.eq_ignore_ascii_case("i")
                     || subject == "we"
                     || subject == "you"
                     || subject == "he"
@@ -1581,12 +1629,10 @@ fn literal(text: &str) -> Option<String> {
                     | "希望"
                     | "打算"
                     | "决定"
-                    | "喜欢2"
                     | "会"
                     | "能"
                     | "可以"
                     | "应该"
-                    | "需要2"
                     | "开车"
                     | "走路"
             );
@@ -1772,8 +1818,11 @@ pub fn english_candidates(text: &str) -> Vec<(u8, String)> {
     }
 
     // 2.2) 句库（整句精确 / 双字重叠 ≥60%）：重叠分越高排得越前
+    // bonus 封顶 4：原来 score/4 最高 25 + 基础 85 = 110，会反超 KIND_MINE(100)，
+    // 违背“用户自己的表达最优先”。现保证 MINE(100) > NATIVE(90) > SENTBANK(≤89)，
+    // 句库内部仍按重叠分保序（/25 取整）。
     for (en, score) in crate::sentbank::lookup(t, 2) {
-        push_scored(&mut scored, KIND_SENTBANK, en, (score.min(100) as i32) / 4);
+        push_scored(&mut scored, KIND_SENTBANK, en, (score.min(100) as i32) / 25);
     }
 
     // 2.5) 大词典整词命中（CC-CEDICT）
@@ -1816,6 +1865,17 @@ pub fn suggest(text: &str) -> String {
 }
 
 /// 英文 -> 语法讲解（离线启发式）。
+/// 过去时线索：末词以 ed 结尾且长度≥5（`red/bed` 才 3 字母，不能算过去时）。
+/// 取末个字母词，剥掉尾标点再判，避免 `played.` 漏判、`red` 误判。
+fn past_tense_hint(lower: &str) -> bool {
+    let last = lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .next_back()
+        .unwrap_or("");
+    last.len() >= 5 && last.ends_with("ed")
+}
+
 pub fn grammar_explain(english: &str) -> String {
     let text = english.trim();
     if text.is_empty() {
@@ -1841,8 +1901,7 @@ pub fn grammar_explain(english: &str) -> String {
     } else if lower.contains(" yesterday")
         || lower.contains(" was ")
         || lower.contains(" were ")
-        || lower.ends_with("ed")
-        || lower.ends_with("ed.")
+        || past_tense_hint(&lower)
     {
         lines.push("时态线索：过去（was / were / 动词-ed / yesterday）".to_string());
     } else if lower.contains("'m ")
@@ -2057,6 +2116,26 @@ mod tests {
         assert_eq!(edit(b"cat", b"dog", 2), None);
         assert_eq!(edit(b"kitten", b"sitting", 2), None);
         assert_eq!(edit(b"", b"", 0), Some(0));
+    }
+
+    #[test]
+    fn morph_and_explain_guards() {
+        // CVC 双写不作用于多音节：open→opening，不是 openning。
+        assert_eq!(verb_ing("open"), "opening");
+        assert_eq!(verb_ing("listen"), "listening");
+        assert_eq!(verb_ing("run"), "running");
+        // o 结尾默认 +s，只有 go/do 类 +es。
+        assert_eq!(verb_s("photo"), "photos");
+        assert_eq!(verb_s("go"), "goes");
+        // 冠词 h 哑音 + one 例外。
+        assert_eq!(article("hour"), "an hour");
+        assert_eq!(article("one"), "a one");
+        // 过去时线索：red/bed 不算，played 算。
+        assert!(!past_tense_hint("red"));
+        assert!(past_tense_hint("played"));
+        // X 了死代码复活：我买了书 → bought。
+        let p = try_patterns("我买了书");
+        assert!(p.as_deref().unwrap_or("").contains("bought"), "got {p:?}");
     }
 
     #[test]

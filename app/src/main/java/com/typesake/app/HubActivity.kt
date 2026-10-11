@@ -52,8 +52,16 @@ class HubActivity : ComponentActivity() {
             }
             tick++
         }
-        tts = TextToSpeech(this) { }
-        tts?.language = Locale.US
+        tts = TextToSpeech(this) { status ->
+            // TTS 引擎异步就绪：在回调里设语言 + 检查离线可用性。
+            // 系统引擎可能联网下载语音/云合成，README 已改成“运行时零网络请求（不含系统 TTS）”。
+            if (status == TextToSpeech.SUCCESS) {
+                val res = tts?.setLanguage(Locale.US)
+                if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts?.setLanguage(Locale.getDefault())
+                }
+            }
+        }
         setContent {
             TypesakeTheme(TypesakePrefs(this@HubActivity).palette) {
                 Surface(Modifier.fillMaxSize()) {
@@ -95,7 +103,7 @@ class HubActivity : ComponentActivity() {
                             }
                         }
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(saved) { p ->
+                            items(saved, key = { "${it.chinese}\n${it.english}\n${it.saved_at}" }) { p ->
                                 GlassCard(
                                     Modifier.fillMaxWidth().clickable {
                                         expanded = if (expanded == p) null else p

@@ -34,17 +34,33 @@ jobs:
       - name: cargo clippy -D warnings
         run: cargo clippy --manifest-path rust-core/Cargo.toml --all-targets -- -D warnings
 
-      # 生成 lex.bin/gram.bin，让混简拼等端到端用例在 CI 真正执行（失败则用例自动跳过）
+      # 生成 lex.bin/gram.bin，让混简拼等端到端用例在 CI 真正执行。
+      # 失败时显式标注 SKIPPED（原来静默跳过，绿但空心）。
       - name: "rust: build lexicon for tests"
         continue-on-error: true
         run: |
-          curl -sSL --max-time 120 -o /tmp/jieba_dict.txt \
+          curl -sSL --proto "=https" --max-time 120 -o /tmp/jieba_dict.txt \
             https://raw.githubusercontent.com/fxsjy/jieba/master/jieba/dict.txt
           cargo run --release --manifest-path rust-core/Cargo.toml --bin lexgen -- \
             --input /tmp/jieba_dict.txt --out app/src/main/assets/lex.bin
 
+      - name: "rust: report optional assets"
+        if: always()
+        run: |
+          for f in app/src/main/assets/lex.bin app/src/main/assets/sentbank.bin; do
+            if [ -f "$f" ]; then echo "asset: $f present ($(du -h "$f" | cut -f1))"; else echo "::warning title=SKIPPED optional asset::$f 缺失，相关端到端用例将跳过"; fi
+          done
+
       - name: cargo test
         run: cargo test --manifest-path rust-core/Cargo.toml --release
+
+      # 回放评测：改键位表/排序后先跑它（top-1/top-5 阈值断言，防排序回退）。
+      - name: replay eval (top-1/top-5)
+        run: cargo run --release --manifest-path rust-core/Cargo.toml --bin replay -- --limit 500 --scheme 1
+
+      # 出货 ABI（arm64 trigrams）至少编译+联想用例跑过：测的必须覆盖发的。
+      - name: cargo test --features trigrams
+        run: cargo test --manifest-path rust-core/Cargo.toml --release --features trigrams
 
   test:
     runs-on: ubuntu-latest
@@ -105,12 +121,12 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
 
-      # ---- 引擎 .so：失败不阻塞出包（APK 会走 Kotlin 兜底，仍可用）----
+      # ---- 引擎 .so：缺失即失败（debug 与 release 同闸，残引擎不再出包） ----
       # 扩展词库（可选）：下载 jieba 词库并生成 lex.bin（失败不阻塞，APK 退回内置 16.5 万词库）
       - name: Build extended lexicon (optional)
         continue-on-error: true
         run: |
-          curl -sSL --max-time 120 -o /tmp/jieba_dict.txt \
+          curl -sSL --proto "=https" --max-time 120 -o /tmp/jieba_dict.txt \
             https://raw.githubusercontent.com/fxsjy/jieba/master/jieba/dict.txt
           cargo run --release --manifest-path rust-core/Cargo.toml --bin lexgen -- \
             --input /tmp/jieba_dict.txt --out app/src/main/assets/lex.bin
@@ -120,7 +136,7 @@ jobs:
       - name: Build sentence bank (optional)
         continue-on-error: true
         run: |
-          curl -sSL --max-time 180 -o /tmp/tatoeba.zip \
+          curl -sSL --proto "=https" --max-time 180 -o /tmp/tatoeba.zip \
             https://object.pouta.csc.fi/OPUS-Tatoeba/v2023-04-12/moses/en-zh_cn.txt.zip
           unzip -o -q /tmp/tatoeba.zip -d /tmp/tatoeba
           python3 tools/gen_sentbank.py \
@@ -130,11 +146,9 @@ jobs:
           ls -lh app/src/main/assets/sentbank.bin
 
       - name: Install cargo-ndk
-        continue-on-error: true
         run: cargo install cargo-ndk --locked
 
       - name: Build Rust .so for 3 ABIs
-        continue-on-error: true
         working-directory: rust-core
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
@@ -157,21 +171,21 @@ jobs:
             if [ -f "app/src/main/jniLibs/$abi/libtypesake_core.so" ]; then
               echo "engine: $abi present"
             else
-              echo "engine: $abi MISSING"
+              echo "::error title=Rust engine missing::$abi 缺 libtypesake_core.so，停止出包"
               missing=1
             fi
           done
           if [ "$missing" = "1" ]; then
-            echo "::warning title=Rust engine incomplete::有 ABI 缺 libtypesake_core.so，真机可能显示「引擎未加载」"
+            exit 1
           fi
 
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      # 只做构建，不跑测试：测试在 test job 里，失败也不影响这里出包
+      # debug 与 release 同闸：lint+单测失败即红，不出包。
       - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace -x lint -x test
+        run: ./gradlew :app:assembleDebug --stacktrace
 
       - name: Show APK size
         run: ls -lh app/build/outputs/apk/debug/*.apk

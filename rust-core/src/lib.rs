@@ -39,6 +39,13 @@ pub const DELIM: char = '\u{1F}';
 /// `join` 的分隔符：预先建好，别在每次返回候选时都 `DELIM.to_string()` 分配一次。
 pub const DELIM_STR: &str = "\u{1F}";
 
+/// 跨语言分隔符协议（与 `ffi::FIELD/ITEM/REC_SEP` 同值，见 `docs/proto.md`）：
+/// - `US`（'\u{1E}'）= 字段分隔；`GS`（'\u{1F}'）= 列表分隔；`RS`（'\u{1D}'）= 子字段分隔。
+/// - Rust 侧统一用这三个常量，Kotlin 侧用 `TypesakeCore.US/GS/RS`（同值），禁止字面量。
+pub const US: char = '\u{1E}';
+pub const GS: char = '\u{1F}';
+pub const RS: char = '\u{1D}';
+
 /// 把字符串列表拼成分隔串（空列表 -> 空串）。
 pub fn join_delim(items: &[String]) -> String {
     items.join(DELIM_STR)

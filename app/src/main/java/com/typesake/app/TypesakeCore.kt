@@ -31,6 +31,7 @@ object TypesakeCore {
             get() = when (kind) {
                 KIND_MINE -> "我的"
                 KIND_NATIVE -> "地道"
+                KIND_DICT -> "词典"
                 KIND_PATTERN -> "结构"
                 KIND_LITERAL -> "直译"
                 KIND_SENTBANK -> "句库"
@@ -57,10 +58,18 @@ object TypesakeCore {
     private const val FIELD = '\u001E'
     private const val RS = '\u001D'
 
+    /** 跨语言分隔符协议（与 Rust `lib::US/GS/RS` 同值，见 `docs/proto.md`）：
+     * US=字段，GS=列表，RS=子字段。禁止各处手写字面量，统一走这三个。 */
+    const val US = '\u001E'
+    const val GS = '\u001F'
+    const val RS_PUB = '\u001D'
+
     const val KIND_MINE = "1"
     const val KIND_NATIVE = "2"
     const val KIND_PATTERN = "3"
     const val KIND_LITERAL = "4"
+    /** 大词典命中（CC-CEDICT）：Rust `KIND_DICT=5`，原来 Kotlin 从 4 跳到 6 导致空标签。 */
+    const val KIND_DICT = "5"
     const val KIND_SENTBANK = "6"
     private const val CACHE_MAX = 64
 
@@ -129,6 +138,7 @@ object TypesakeCore {
     @JvmStatic private external fun fixSpelling(word: String): String
     @JvmStatic private external fun expandShortcut(input: String): String
     @JvmStatic private external fun vocabLevels(): String
+    @JvmStatic private external fun errorHistory(): String
     @JvmStatic private external fun setFeatureOptions(
         gloss: Boolean,
         freshMark: Boolean,
@@ -525,7 +535,25 @@ object TypesakeCore {
                 fuzzy = boolField(raw, "fuzzy"),
                 correction = boolField(raw, "correction"),
             )
-        }.getOrDefault(Stats(saved = MemStore.list().size))
+        }.getOrElse { e ->
+            android.util.Log.w("TypesakeCore", "statsInfo 解析失败", e)
+            Stats(saved = MemStore.list().size)
+        }
+    }
+
+    /** 错误历史（环形 8 条）：`[{"t":ts,"m":"msg"}]` 解析失败返回空列表。旧 .so 无此符号时返回空。 */
+    fun errors(): List<Pair<Long, String>> {
+        if (!available) return emptyList()
+        return runCatching {
+            val raw = errorHistory().trim()
+            if (raw.isEmpty() || raw == "[]") return emptyList()
+            val arr = json.decodeFromString<List<Map<String, kotlinx.serialization.json.JsonElement>>>(raw)
+            arr.mapNotNull { m ->
+                val t = m["t"]?.toString()?.toLongOrNull() ?: 0L
+                val msg = m["m"]?.toString()?.trim('"') ?: ""
+                if (msg.isEmpty()) null else t to msg
+            }
+        }.getOrElse { emptyList() }
     }
 
     fun suggest(chinese: String): String =

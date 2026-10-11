@@ -65,6 +65,12 @@ type CharCache = Mutex<HashMap<char, Vec<(String, u64)>>>;
 /// 声母串 -> 候选词缓存
 type RunCache = Mutex<HashMap<String, Vec<(String, u64)>>>;
 
+/// 三处缓存上限：都以用户输入为 key 无界增长，长会话只涨不跌。
+/// 到量整清（与 `engine::CACHE_CAP` 同策略，便宜且够用）。
+const WORD_FREQ_CAP: usize = 2048;
+const CHAR_CACHE_CAP: usize = 64;
+const RUN_CACHE_CAP: usize = 256;
+
 fn common_bonus(word: &str) -> f64 {
     if initials::is_common(word) {
         COMMON_BONUS
@@ -115,6 +121,9 @@ fn word_freq(eng: &PinyinEngine, word: &str) -> u64 {
     }
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() >= WORD_FREQ_CAP {
+            c.clear();
+        }
         c.insert(word.to_string(), freq);
     }
     freq
@@ -143,6 +152,9 @@ fn chars_for_initial(eng: &PinyinEngine, letter: char, k: usize) -> Vec<(String,
     let list: Vec<(String, u64)> = hits.into_iter().take(8).map(|(f, w)| (w, f)).collect();
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() >= CHAR_CACHE_CAP {
+            c.clear();
+        }
         c.insert(letter, list.clone());
     }
     list.into_iter().take(k).collect()
@@ -187,6 +199,9 @@ fn run_candidates(eng: &PinyinEngine, run: &str, k: usize) -> Vec<(String, u64)>
     out.truncate(16);
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() >= RUN_CACHE_CAP {
+            c.clear();
+        }
         c.insert(run.to_string(), out.clone());
     }
     out

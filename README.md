@@ -9,11 +9,14 @@
 rust-core/                Rust 离线语言引擎（cdylib，经 JNI 供 Kotlin 调用）
   engine.rs               拼音->候选（精确 / 整句 Viterbi / 前缀补全）+ 联想 + 词频学习(L0)
   english.rs              中文->英文（词典贪心 + 覆盖度阈值，不吐垃圾）
-  store.rs                收藏与学习快照：原子写（tmp + rename）
-  ffi.rs                  JNI 边界，全部 catch_unwind（panic 不跨 FFI）
+  store.rs                收藏与学习快照：原子写（tmp + rename + 目录 fsync，损坏隔离 .corrupt，恢复前 .bak）
+  ffi.rs                  JNI 边界，全部 catch_unwind（panic 不跨 FFI；入参 null/异常安全，出参永不 expect）
+  docs/proto.md           跨语言分隔符协议（US/GS/RS 三端统一）
 app/                      Kotlin 壳（IME 只能是 Kotlin/Java）+ Compose
   kb/KbModels.kt          纯数据布局：字母/数字/电话/符号页、emoji、长按变体、inputType 映射
+  kb/InputRouter.kt       纯函数路由：快捷形状守卫 + 注音键分流（可单测）
   kb/KeyboardView.kt      自绘键盘：键帽/按下态/震动/按键预览/长按变体/单手/emoji/剪贴板
+  TypesakeCore.kt         JNI 门面：分隔串解析 + KIND 标签（含词典 5）+ 错误历史
   TypesakeImeService.kt   输入逻辑：composing、候选择、联想、双击空格收藏、隐私字段保护
   MainActivity.kt         启用指引 + 试打 + 键盘设置（主题/高度/震动/声音/预览/剪贴板）
   HubActivity.kt          学习中心：收藏列表 + 语法讲解
@@ -51,7 +54,7 @@ Viterbi 整句组合 + bigram 联想 + L0 用户学习层）；`trigrams` 特性
 - 双击空格 / ★ 收藏**整句**（从光标前取当前句）
 
 **键盘**
-- 常驻数字行、符号页、emoji 面板、剪贴板历史（仅本机内存，最多 20 条）
+- 常驻数字行、符号页、emoji 面板、剪贴板历史（仅 IME 进程内存，最多 20 条；进程存活期间跨应用保留，可一键清空；密码框不记录）
 - 长按字母出重音变体；⇧ 双击/长按 = 大小写锁定
 - 震动、按键声音、按键预览气泡（均可关）
 - 主题跟随系统/浅色/深色；按键高度 34–62dp 可调；单手模式（左/右）
@@ -93,7 +96,7 @@ Viterbi 整句组合 + bigram 联想 + L0 用户学习层）；`trigrams` 特性
   长按数字键可插原始数字/字母/标点；设置里一键切换全键盘/九键
 - **以词定字**：长按多字候选弹出单字行，可只取其中一字
 - **trigram 联想**：CI 只对 arm64 编 `--features trigrams`（体积 +13.5MB），其余 ABI 用 bigram
-- **B2 TTS 朗读**：学习中心每条收藏可朗读（系统离线 TTS）
+- **B2 TTS 朗读**：学习中心每条收藏可朗读（系统 TTS，未限定仅离线引擎；运行时零网络请求不含系统 TTS 自身行为）
 - **B4 收藏可编辑**：学习中心可编辑英文（反哺翻译记忆，以后同类句子优先用你自己的表达）
 - **B5 统计可视化**：首页 12 周输入热力图 + 连续天数
 - **C1 启动移出主线程**：词典拷贝/JSON 载入/L0 导入全在 IO 协程，完成后自动刷新界面
@@ -205,8 +208,9 @@ cargo run --manifest-path rust-core/Cargo.toml --bin replay -- --limit 500 --sch
 
 ## CI / 发布
 
-- `.github/workflows/android.yml`：`cargo fmt/clippy/test` → 3 ABI `.so` → `testDebugUnitTest` +
-  `lintDebug` + `assembleDebug` → 上传 `typesake-debug-apk` 与报告
+- `.github/workflows/android.yml`：`cargo fmt/clippy/test` + `replay --limit 500` +
+  `test --features trigrams` → 3 ABI `.so`（缺失即失败）→ `testDebugUnitTest` +
+  `lintDebug` + `assembleDebug`（同闸，红即不出包）→ 上传 `typesake-debug-apk` 与报告
 - `.github/workflows/release.yml`：打 tag（`v*`）触发，`assembleRelease` 并创建 GitHub Release。
   每次发布会用 `apksigner` 打印签名证书指纹，日志可审计
 
@@ -240,13 +244,15 @@ cargo run --manifest-path rust-core/Cargo.toml --bin replay -- --limit 500 --sch
   署名与再分发要求见 `THIRD_PARTY_NOTICES.md`
 - 词级分级表 `app/src/main/assets/cefr.tsv`：CEFR-J Wordlist v1.5（可商用、需署名）
   + Octanove C1/C2 v1.0（CC BY 4.0）合成，出处与引用格式见 `THIRD_PARTY_NOTICES.md`
+- 简繁词表 `app/src/main/assets/s2t.tsv`/`t2s.tsv`：OpenCC（BYVoid，Apache-2.0），见 `THIRD_PARTY_NOTICES.md` 与包内 `assets/LICENSE_DICTS.txt`
+- 包内许可文本：`app/src/main/assets/LICENSE_DICTS.txt`（随 APK 分发，满足 BY-SA/BY 署名要求）；设置页「开源许可」可查看摘要
 
 ## 已知边界
 
 - 英文表达是离线词典法（约 200 条常用句 + 贪心组合），不是机器翻译；未命中时留空并可后补
   （AI 增强：本地小模型 / 云端改写为后续工作）
 - 整句组合（Viterbi）走的是无 trigram 的 bigram 排序，长句优先级以词频为主
-- 剪贴板历史不落盘，退出即清空（隐私优先）
+- 剪贴板历史不落盘，IME 进程内存保留（进程存活期间跨应用保留，可一键清空；密码框不记录）
 - **大千注音没有专属键盘布局**：仍用字母键盘 + 数字行 + `?123` 符号页。注音击键里的
   `0-9` `,` `.` `;` `/` `-` 与选词/翻页/句号键撞车，现按方案分流（`zhuyinInput()`）：
   数字与 `-` 永远进组合区，`,.` `;` `/` 只在组合中或主键区当注音键，符号页的 `，` `。`

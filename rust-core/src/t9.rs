@@ -91,7 +91,11 @@ fn cache() -> &'static Mutex<HashMap<String, Vec<String>>> {
 const CACHE_CAP: usize = 48;
 
 /// 九键候选：合并各展开的廉价查询结果。
+///
+/// 缓存统一按 24 条存（读时再截到 `limit`）：原来存的是截断后结果，
+/// 先 `limit=8` 再 `limit=24` 会拿不全。
 pub fn candidates(digits: &str, limit: usize) -> Vec<String> {
+    const STORE: usize = 24;
     let key: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
     if key.is_empty() || limit == 0 {
         return Vec::new();
@@ -105,9 +109,16 @@ pub fn candidates(digits: &str, limit: usize) -> Vec<String> {
         }
     }
     let eng = engine::engine();
+    // 展开预算按输入长度收紧（文档承诺：≤3 位 36 种，4 位 24 种，5 位以上 12 种；
+    // 原来恒 400，长数字串每键 400 次 FST 扫描必卡）。
+    let branch_cap = match key.len() {
+        0..=3 => 36,
+        4 => 24,
+        _ => 12,
+    };
     // (0=精确命中该拼音, 1=前缀补全) 优先，其次保持展开顺序
     let mut scored: Vec<(u8, usize, String)> = Vec::new();
-    for (i, exp) in expand_pruned(&key, 400).into_iter().enumerate() {
+    for (i, exp) in expand_pruned(&key, branch_cap).into_iter().enumerate() {
         if exp.is_empty() {
             continue;
         }
@@ -120,20 +131,20 @@ pub fn candidates(digits: &str, limit: usize) -> Vec<String> {
             }
             let rank = if hits.first() == Some(w) { 0u8 } else { 1u8 };
             scored.push((rank, i, w.clone()));
-            if scored.len() >= limit * 4 {
+            if scored.len() >= STORE * 4 {
                 break;
             }
         }
-        if scored.len() >= limit * 4 {
+        if scored.len() >= STORE * 4 {
             break;
         }
     }
     scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut out: Vec<String> = Vec::new();
+    let mut full: Vec<String> = Vec::new();
     for (_, _, w) in scored {
-        if !out.contains(&w) {
-            out.push(w);
-            if out.len() >= limit {
+        if !full.contains(&w) {
+            full.push(w);
+            if full.len() >= STORE {
                 break;
             }
         }
@@ -143,8 +154,10 @@ pub fn candidates(digits: &str, limit: usize) -> Vec<String> {
         if c.len() >= CACHE_CAP {
             c.clear();
         }
-        c.insert(key, out.clone());
+        c.insert(key, full.clone());
     }
+    let mut out = full;
+    out.truncate(limit);
     out
 }
 
@@ -174,6 +187,15 @@ mod tests {
     fn pruned_expansion_keeps_real_path() {
         let exps = expand_pruned("64426", 400);
         assert!(exps.contains(&"nihao".to_string()), "got {exps:?}");
+    }
+
+    #[test]
+    fn t9_cache_stores_full_limit() {
+        clear_cache();
+        let full = candidates("64426", 24);
+        let small = candidates("64426", 5);
+        assert_eq!(&full[..small.len()], &small[..]);
+        clear_cache();
     }
 
     #[test]

@@ -42,21 +42,40 @@ pub fn load_bytes(data: Vec<u8>) -> usize {
         return 0;
     }
     let count = u32_at(&data, 8) as usize;
-    let index_end = HEADER + count * REC;
-    if index_end > data.len() {
+    let index_end = HEADER.saturating_add(count.saturating_mul(REC));
+    if index_end > data.len() || index_end < HEADER {
         return 0;
     }
     let mut gram_len = 0usize;
     let mut val_len = 0usize;
     for i in 0..count {
         let p = HEADER + i * REC;
-        gram_len = gram_len.max(u32_at(&data, p) as usize + u16_at(&data, p + 4) as usize);
-        val_len = val_len.max(u32_at(&data, p + 6) as usize + u16_at(&data, p + 10) as usize);
+        gram_len =
+            gram_len.max((u32_at(&data, p) as usize).saturating_add(u16_at(&data, p + 4) as usize));
+        val_len = val_len
+            .max((u32_at(&data, p + 6) as usize).saturating_add(u16_at(&data, p + 10) as usize));
     }
     let gram_base = index_end;
-    let val_base = gram_base + gram_len;
-    if val_base + val_len > data.len() {
+    let val_base = gram_base.saturating_add(gram_len);
+    if val_base.saturating_add(val_len) > data.len() {
         return 0;
+    }
+    // 逐条校验：gram 落在 gram 区，val 落在 val 区。任一条越界即拒装。
+    let gram_end = gram_base.saturating_add(gram_len);
+    let val_end = val_base.saturating_add(val_len);
+    for i in 0..count {
+        let p = HEADER + i * REC;
+        let g_off = u32_at(&data, p) as usize;
+        let g_len = u16_at(&data, p + 4) as usize;
+        let v_off = u32_at(&data, p + 6) as usize;
+        let v_len = u16_at(&data, p + 10) as usize;
+        let gs = gram_base.saturating_add(g_off);
+        let ge = gs.saturating_add(g_len);
+        let vs = val_base.saturating_add(v_off);
+        let ve = vs.saturating_add(v_len);
+        if ge > gram_end || vs < val_base || ve > val_end || ge < gs || ve < vs {
+            return 0;
+        }
     }
     let idx = Idx {
         data,
@@ -89,15 +108,17 @@ impl Idx {
         let p = HEADER + i * REC;
         let off = u32_at(&self.data, p) as usize;
         let len = u16_at(&self.data, p + 4) as usize;
-        &self.data[self.gram_base + off..self.gram_base + off + len]
+        let s = self.gram_base.saturating_add(off);
+        self.data.get(s..s.saturating_add(len)).unwrap_or(&[])
     }
 
     fn val(&self, i: usize) -> &str {
         let p = HEADER + i * REC;
         let off = u32_at(&self.data, p + 6) as usize;
         let len = u16_at(&self.data, p + 10) as usize;
-        std::str::from_utf8(&self.data[self.val_base + off..self.val_base + off + len])
-            .unwrap_or("")
+        let s = self.val_base.saturating_add(off);
+        let e = s.saturating_add(len);
+        std::str::from_utf8(self.data.get(s..e).unwrap_or(&[])).unwrap_or("")
     }
 
     fn lower_bound(&self, key: &[u8]) -> usize {

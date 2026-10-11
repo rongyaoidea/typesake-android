@@ -82,6 +82,8 @@ class MainActivity : ComponentActivity() {
 private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -> Unit) {
     val context = LocalContext.current
     val prefs = remember { TypesakePrefs(context) }
+    // 点击处理器里的 setOptions/setFeatures/restore/forget（fsync+重载表）放 IO 线程，免 ANR。
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     var themeMode by remember { mutableIntStateOf(prefs.themeMode) }
     var keyHeight by remember { mutableFloatStateOf(prefs.keyHeightDp.toFloat()) }
@@ -92,8 +94,16 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
     var palette by remember { mutableIntStateOf(paletteId) }
     var fuzzy by remember { mutableStateOf(prefs.fuzzy) }
     var correction by remember { mutableStateOf(prefs.correction) }
-    var statTick by remember { mutableIntStateOf(readyTick) }
-    var tick by remember { mutableIntStateOf(readyTick) }
+    var statTick by remember(readyTick) { mutableIntStateOf(readyTick) }
+    var tick by remember(readyTick) { mutableIntStateOf(readyTick) }
+    // 引擎就绪后重载一次：原来 `remember{Int(readyTick)}` 不跟随 ready，
+    // 冷启动进设置统计/方案恒空。ready 变化即跟进。
+    androidx.compose.runtime.LaunchedEffect(readyTick) {
+        if (readyTick > 0) {
+            statTick = readyTick
+            tick = readyTick
+        }
+    }
     var shuangpin by remember { mutableIntStateOf(prefs.shuangpin) }
     var glossOn by remember { mutableStateOf(prefs.gloss) }
     var freshOn by remember { mutableStateOf(prefs.freshMark) }
@@ -195,12 +205,22 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
             label = { Text("输入中文，如：谢谢 / 今天开会") },
             modifier = Modifier.fillMaxWidth(),
         )
-        val english = remember(trial) { TypesakeCore.suggest(trial) }
+        val english = remember { mutableStateOf("") }
+        androidx.compose.runtime.LaunchedEffect(trial) {
+            val t = trial
+            withContext(Dispatchers.IO) {
+                val en = TypesakeCore.suggest(t)
+                withContext(Dispatchers.Main) {
+                    // 试打框每键触发 suggest（JNI+查词）：放 IO 线程，回主线程只赋值。
+                    if (t == trial) english.value = en
+                }
+            }
+        }
         GlassCard {
             Column(Modifier.padding(14.dp)) {
                 Text("英文伴学", style = MaterialTheme.typography.titleSmall)
                 Text(
-                    if (english.isBlank()) "（暂无对应表达，换个常用说法试试）" else english,
+                    if (english.value.isBlank()) "（暂无对应表达，换个常用说法试试）" else english.value,
                     style = MaterialTheme.typography.bodyLarge,
                 )
             }
@@ -229,8 +249,11 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("$py → $w", style = MaterialTheme.typography.bodyMedium)
                             Text("恢复", style = MaterialTheme.typography.bodySmall, modifier = Modifier.clickable {
-                                TypesakeCore.restoreWord(py, w)
-                                blocked = TypesakeCore.blockedList()
+                                scope.launch(Dispatchers.IO) {
+                                    TypesakeCore.restoreWord(py, w)
+                                    val next = TypesakeCore.blockedList()
+                                    withContext(Dispatchers.Main) { blocked = next }
+                                }
                             })
                         }
                     }
@@ -286,8 +309,11 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
                             "删除",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.clickable {
-                                TypesakeCore.forget(w.pinyin, w.word)
-                                words = TypesakeCore.myWords()
+                                scope.launch(Dispatchers.IO) {
+                                    TypesakeCore.forget(w.pinyin, w.word)
+                                    val next = TypesakeCore.myWords()
+                                    withContext(Dispatchers.Main) { words = next }
+                                }
                             },
                         )
                     }
@@ -297,27 +323,48 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = {
-                        TypesakeCore.resetLearning()
-                        words = TypesakeCore.myWords()
-                        savedFlash = "已清空学习记录"
+                        scope.launch(Dispatchers.IO) {
+                            TypesakeCore.resetLearning()
+                            val next = TypesakeCore.myWords()
+                            withContext(Dispatchers.Main) {
+                                words = next
+                                savedFlash = "已清空学习记录"
+                            }
+                        }
                     }) { Text("清空学习记录") }
                     OutlinedButton(onClick = {
-                        val json = TypesakeCore.backupJson()
-                        if (json.isNotEmpty()) {
-                            val send = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_TEXT, json)
+                        scope.launch(Dispatchers.IO) {
+                            val json = TypesakeCore.backupJson()
+                            withContext(Dispatchers.Main) {
+                                if (json.isNotEmpty()) {
+                                    // 分享前提示：备份含姓名/收藏/行为数据的明文，只发给自己。
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "备份含姓名/收藏/输入统计（明文），只发给自己",
+                                        android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                    val send = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_TEXT, json)
+                                    }
+                                    context.startActivity(Intent.createChooser(send, "备份词库"))
+                                }
                             }
-                            context.startActivity(Intent.createChooser(send, "备份词库"))
                         }
                     }) { Text("分享备份") }
                     OutlinedButton(onClick = {
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
-                            ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
-                        val ok = TypesakeCore.restoreJson(text)
-                        words = TypesakeCore.myWords()
-                        savedFlash = if (ok) "已从剪贴板恢复词库" else "剪贴板里没有可用的备份 JSON"
+                        scope.launch(Dispatchers.IO) {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                                ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                            // 恢复前自动备份当前库由 Rust 侧 `.bak` 兜底；超大/错版直接拒绝。
+                            val ok = TypesakeCore.restoreJson(text)
+                            val next = TypesakeCore.myWords()
+                            withContext(Dispatchers.Main) {
+                                words = next
+                                savedFlash = if (ok) "已从剪贴板恢复词库" else "剪贴板里没有可用的备份 JSON"
+                            }
+                        }
                     }) { Text("剪贴板恢复") }
                 }
             }
@@ -363,7 +410,7 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
                             OutlinedButton(onClick = {
                                 shuangpin = s.id
                                 prefs.shuangpin = s.id
-                                TypesakeCore.setOptions(fuzzy, correction, s.id, script)
+                                scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setOptions(fuzzy, correction, s.id, script) }
                             }) { Text(s.name) }
                         }
                     }
@@ -373,22 +420,22 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
         SwitchRow("候选旁逐词译词", glossOn) {
             glossOn = it
             prefs.gloss = it
-            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn) }
         }
         SwitchRow("生词橙标（还没上屏过的词）", freshOn) {
             freshOn = it
             prefs.freshMark = it
-            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn) }
         }
         SwitchRow("快捷输入（v 算式 / i 中文数字 / u 码点）", shortcutOn) {
             shortcutOn = it
             prefs.shortcut = it
-            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn) }
         }
         SwitchRow("英文模式拼写纠正", enFixOn) {
             enFixOn = it
             prefs.englishFix = it
-            TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setFeatures(glossOn, freshOn, shortcutOn, enFixOn) }
         }
         Text("词汇分级统计（CEFR）", style = MaterialTheme.typography.bodyMedium)
         if (vocabLevels.isEmpty()) {
@@ -435,7 +482,7 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
         SwitchRow("输出繁体（简繁转换）", script == 1) {
             script = if (it) 1 else 0
             prefs.script = script
-            TypesakeCore.setOptions(fuzzy, correction, shuangpin, script)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setOptions(fuzzy, correction, shuangpin, script) }
         }
         SwitchRow("隐藏数字行（上滑出数字/符号）", hideNumberRow) {
             hideNumberRow = it
@@ -501,12 +548,12 @@ private fun SetupScreen(paletteId: Int, readyTick: Int, onPaletteChange: (Int) -
         SwitchRow("模糊音（z/zh、n/l、an/ang…）", fuzzy) {
             fuzzy = it
             prefs.fuzzy = it
-            TypesakeCore.setOptions(it, correction, shuangpin, script)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setOptions(it, correction, shuangpin, script) }
         }
         SwitchRow("击键纠错（邻键/漏键/多键/换位）", correction) {
             correction = it
             prefs.correction = it
-            TypesakeCore.setOptions(fuzzy, it, shuangpin, script)
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { TypesakeCore.setOptions(fuzzy, it, shuangpin, script) }
         }
         Text("按键高度 ${keyHeight.toInt()} dp", style = MaterialTheme.typography.bodyMedium)
         Slider(

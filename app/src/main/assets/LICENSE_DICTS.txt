@@ -1,0 +1,21 @@
+Typesake Android bundled dictionary licenses (summary; full texts linked in-app).
+
+1) CC-CEDICT (app/src/main/assets/en_dict.tsv)
+   Upstream: https://www.mdbg.net/chinese/dictionary?page=cc-cedict
+   License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+   https://creativecommons.org/licenses/by-sa/4.0/
+   Notes: filtered to 1-4 char entries, most common gloss kept, CL:/variant markers
+   removed (see THIRD_PARTY_NOTICES.md). This data file and derivatives stay CC BY-SA 4.0;
+   app code stays MIT.
+
+2) OpenCC (app/src/main/assets/s2t.tsv, t2s.tsv)
+   Upstream: https://github.com/BYVoid/OpenCC (BYVoid and contributors)
+   License: Apache License 2.0 — https://www.apache.org/licenses/LICENSE-2.0
+
+3) CEFR-J Wordlist v1.5 + Octanove C1/C2 v1.0 (app/src/main/assets/cefr.tsv)
+   CEFR-J: research & commercial use allowed, attribution required.
+   Required citation: "The CEFR-J Wordlist Version 1.5. Compiled by Yukio Tono,
+   Tokyo University of Foreign Studies. Retrieved from http://www.cefr-j.org/download.html"
+   Octanove C1/C2: CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/
+
+Full per-asset details: THIRD_PARTY_NOTICES.md in the repo.

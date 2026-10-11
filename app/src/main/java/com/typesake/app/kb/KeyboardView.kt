@@ -426,7 +426,7 @@ class KeyboardView(
                 addState(intArrayOf(), idle)
             }
             setPadding(dp(2), 0, dp(2), 0)
-            setContentDescription(key.label)
+            contentDescription = describe(key)
             setOnTouchListener { v, e -> handleTouch(this, e) }
         }
 
@@ -441,15 +441,33 @@ class KeyboardView(
             val label = ch.toString()
             key = key.copy(label = label, action = KbAction.Insert(label))
             text = swipeHint(label)
-            contentDescription = label
+            contentDescription = describe(key)
         }
 
         /** 只换字面（Shift 键 ⇧/⇪ 这类动作键用，行为不变）。 */
         fun setLabel(label: String) {
             key = key.copy(label = label)
             text = label
-            contentDescription = label
+            contentDescription = describe(key)
         }
+    }
+
+    /** 动作键中文描述（TalkBack 朗读 ⌫/⇧ 无意义，原来直接读符号）。 */
+    private fun describe(key: KbKey): String = when (val a = key.action) {
+        KbAction.Backspace -> "删除"
+        KbAction.Shift -> "上档"
+        KbAction.Enter -> "回车"
+        KbAction.Space -> "空格"
+        KbAction.Language -> "切换语言"
+        KbAction.OpenHub -> "学习中心"
+        KbAction.OneHandToggle -> "单手模式"
+        KbAction.CursorLeft -> "左移光标"
+        KbAction.CursorRight -> "右移光标"
+        KbAction.ToggleEnglish -> "中英切换"
+        KbAction.HideKeyboard -> "收起键盘"
+        KbAction.OpenSettings -> "键盘设置"
+        is KbAction.ShowLayer -> "符号层"
+        is KbAction.Insert -> key.label
     }
 
     /** 学百度：键面右上角用浅色小字提示"上滑符号"，解决"不知道有这功能"。 */
@@ -485,27 +503,32 @@ class KeyboardView(
                 stopRepeat()
                 v.isPressed = false
                 dismissPreview()
+                // 长按变体弹层 showing 时：手指抬起不能直接 dismiss（否则弹层在可点前被销毁，
+                // 变体永远点不到）。吞掉这次 UP，弹层点选/点外由 PopupWindow 自己处理。
+                if (alternates != null) {
+                    return true
+                }
                 // 上滑手势天然会滑出键的上边界：滑动判定不要求仍在键内
                 val key = (v as KeyButton).key
                 val dx = e.x - downX
                 val dy = e.y - downY
-                val swiped = (dy < -dp(12) && dx < dp(18)) ||
-                    (key.action is KbAction.Backspace && dx < -dp(12)) ||
-                    (key.action is KbAction.Space && (dx > dp(12) || dx < -dp(12)))
-                if (alternates == null && (inside(v, e) || swiped)) {
+                // 滑动阈值 24dp（原来 12dp：正常点按抖动即触发空格移光标/删词块丢数据）。
+                val swiped = (dy < -dp(24) && dx < dp(18)) ||
+                    (key.action is KbAction.Backspace && dx < -dp(24)) ||
+                    (key.action is KbAction.Space && (dx > dp(24) || dx < -dp(24)))
+                if (inside(v, e) || swiped) {
                     when {
                         // A7：阈值按密度换算（原来是像素，高 DPI 屏上过灵敏）
-                        dy < -dp(12) && dx < dp(18) -> swipeUp(key)
-                        key.action is KbAction.Backspace && dx < -dp(12) ->
+                        dy < -dp(24) && dx < dp(18) -> swipeUp(key)
+                        key.action is KbAction.Backspace && dx < -dp(24) ->
                             listener?.onDeleteWord()
-                        key.action is KbAction.Space && dx > dp(12) ->
+                        key.action is KbAction.Space && dx > dp(24) ->
                             listener?.onCursorRight()
-                        key.action is KbAction.Space && dx < -dp(12) ->
+                        key.action is KbAction.Space && dx < -dp(24) ->
                             listener?.onCursorLeft()
                         else -> perform(key)
                     }
                 }
-                dismissAlternates()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
@@ -520,7 +543,7 @@ class KeyboardView(
                 val dx = e.x - downX
                 val dy = e.y - downY
                 // 一旦判定为滑动，立即取消长按（否则长按弹层会抢走上滑手势）
-                if (kotlin.math.abs(dx) > dp(12) || kotlin.math.abs(dy) > dp(12)) {
+                if (kotlin.math.abs(dx) > dp(24) || kotlin.math.abs(dy) > dp(24)) {
                     cancelPendingLongPress()
                 }
                 if (!inside(v, e)) {
@@ -690,10 +713,11 @@ class KeyboardView(
     private fun positionAbove(popup: PopupWindow, anchor: View, w: Int, h: Int) {
         val loc = IntArray(2)
         anchor.getLocationInWindow(loc)
-        val x = loc[0] + anchor.width / 2 - w / 2
+        val screenW = resources.displayMetrics.widthPixels
+        val x = (loc[0] + anchor.width / 2 - w / 2).coerceIn(0, (screenW - w).coerceAtLeast(0))
         val y = loc[1] - h - dp(4)
         try {
-            popup.showAtLocation(this, Gravity.NO_GRAVITY, x.coerceAtLeast(0), y.coerceAtLeast(0))
+            popup.showAtLocation(this, Gravity.NO_GRAVITY, x, y.coerceAtLeast(0))
         } catch (_: Exception) {
             // 窗口 token 失效（切换输入框瞬间）时静默忽略
         }

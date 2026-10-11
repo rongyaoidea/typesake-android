@@ -135,14 +135,16 @@ fn build() -> Initials {
     }
 
     for v in table.values_mut() {
-        // 常用词优先，其次词频，最后字典序（保证稳定）
+        // 常用词优先，其次词频，最后字典序（保证稳定）。
+        // 先按词去重再排序：`dedup_by` 只去连续重复，非相邻同词会残留。
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v.dedup_by(|a, b| a.1 == b.1);
         v.sort_by(|a, b| {
             is_common(&b.1)
                 .cmp(&is_common(&a.1))
                 .then_with(|| b.0.cmp(&a.0))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        v.dedup_by(|a, b| a.1 == b.1);
         v.truncate(PER_KEY);
     }
 

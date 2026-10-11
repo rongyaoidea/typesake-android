@@ -159,7 +159,7 @@ fn db_path(dir: &str) -> PathBuf {
     Path::new(dir).join("typesake_db.json")
 }
 
-/// 原子写：tmp + rename（同目录，同文件系统）。
+/// 原子写：tmp + rename（同目录，同文件系统）+ 父目录 fsync。
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     {
@@ -168,7 +168,26 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // 父目录 fsync：否则断电可能只丢目录项（文件改名未落盘），重启回到旧文件。
+    // Android 上这是冷路径（选词节流 / 设置页），成本可接受；失败不报错（尽力）。
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// 落盘节流：选词是高频路径，全量排序 4 万条 + 序列化 + fsync 每次都做会卡手。
+/// 距上次落盘 <2s 则跳过（`flushStorage` 走强制路径兜底）。
+static LAST_PERSIST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 把收藏句子灌进英文翻译记忆（用户自己的表达最优先）。
@@ -232,11 +251,6 @@ fn db_from(f: StoreFields) -> Db {
     }
 }
 
-/// 锁内生成落盘快照（目录 + 序列化结构），不含任何 IO。
-fn snapshot(s: &Store) -> (String, Db) {
-    (s.dir.clone(), db_from(store_fields(s)))
-}
-
 /// 在锁外落盘（含 fsync）。调用方必须先 `drop` 锁再调用，
 /// 避免文件 IO 期间持有全局 store 锁。
 fn write_snapshot(snap: &(String, Db)) -> Result<(), String> {
@@ -267,9 +281,24 @@ fn word_picks_sorted(m: &HashMap<String, u32>) -> Vec<(String, u32)> {
 }
 
 /// 初始化存储目录：载入收藏 / L0 / 设置 / 统计 / 纠错记忆。返回 (收藏数, pins 数)。
+///
+/// 损坏的 DB 不再静默归零：先把原文件改名为 `typesake_db.json.corrupt.<ts>` 保留取证，
+/// 再建空库并 `note_error`（设置页「引擎自检」可见），避免下次 `persist` 直接覆盖丢失现场。
 pub fn init(dir: &str) -> Result<(usize, usize), String> {
-    let db = match std::fs::read(db_path(dir)) {
-        Ok(bytes) => serde_json::from_slice::<Db>(&bytes).unwrap_or_else(|_| empty_db()),
+    let path = db_path(dir);
+    let db = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Db>(&bytes) {
+            Ok(db) => db,
+            Err(e) => {
+                let ts = now_secs();
+                let corrupt = path.with_extension(format!("json.corrupt.{ts}"));
+                let _ = std::fs::rename(&path, &corrupt);
+                crate::engine::note_error(&format!(
+                    "词库文件损坏已隔离重置（{e}），原文件保留取证"
+                ));
+                empty_db()
+            }
+        },
         Err(_) => empty_db(),
     };
     let pins = db.l0.pins.len();
@@ -323,19 +352,22 @@ pub fn set_settings(
     script: u8,
 ) -> Result<(), String> {
     engine::set_options(fuzzy, correction, shuangpin);
-    let mut s = store_guard();
-    let mut ns = s.settings.clone();
-    ns.fuzzy = fuzzy;
-    ns.correction = correction;
-    ns.shuangpin = shuangpin;
-    ns.script = script;
-    s.settings = ns;
-    let snap = snapshot(&s);
-    drop(s);
+    // 锁内只改内存 + 拷字段，排序/取引擎/序列化全在锁外（`db_from` 很贵）。
+    let (dir, fields) = {
+        let mut s = store_guard();
+        let mut ns = s.settings.clone();
+        ns.fuzzy = fuzzy;
+        ns.correction = correction;
+        ns.shuangpin = shuangpin;
+        ns.script = script;
+        s.settings = ns;
+        (s.dir.clone(), store_fields(&s))
+    };
+    let snap = (dir.clone(), db_from(fields));
     write_snapshot(&snap)?;
     let _ = s2t::load_dicts(
-        &Path::new(&snap.0).join("s2t.tsv").to_string_lossy(),
-        &Path::new(&snap.0).join("t2s.tsv").to_string_lossy(),
+        &Path::new(&dir).join("s2t.tsv").to_string_lossy(),
+        &Path::new(&dir).join("t2s.tsv").to_string_lossy(),
         script == 1,
     );
     Ok(())
@@ -348,16 +380,17 @@ pub fn set_features(
     shortcut: bool,
     english_fix: bool,
 ) -> Result<(), String> {
-    let mut s = store_guard();
-    let mut ns = s.settings.clone();
-    ns.gloss = gloss;
-    ns.fresh_mark = fresh_mark;
-    ns.shortcut = shortcut;
-    ns.english_fix = english_fix;
-    s.settings = ns;
-    let snap = snapshot(&s);
-    drop(s);
-    write_snapshot(&snap)
+    let (dir, fields) = {
+        let mut s = store_guard();
+        let mut ns = s.settings.clone();
+        ns.gloss = gloss;
+        ns.fresh_mark = fresh_mark;
+        ns.shortcut = shortcut;
+        ns.english_fix = english_fix;
+        s.settings = ns;
+        (s.dir.clone(), store_fields(&s))
+    };
+    write_snapshot(&(dir, db_from(fields)))
 }
 
 /// 该词是不是生词（还从没上屏过）。词典没数据时也照常返回 true——
@@ -379,8 +412,18 @@ pub fn bump_word(word: &str) {
     }
     let mut s = store_guard();
     if s.word_picks.len() >= MAX_WORD_PICKS && !s.word_picks.contains_key(w) {
-        // 满了先清掉只打过一次的，保住用得多的
+        // 满了先清掉只打过一次的，保住用得多的；若没有计数为 1 的（全是高频），
+        // 按计数最小批量删 10% 兜底，避免无界增长。
         s.word_picks.retain(|_, c| *c > 1);
+        if s.word_picks.len() >= MAX_WORD_PICKS {
+            let mut items: Vec<(String, u32)> =
+                s.word_picks.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            items.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let cut = (s.word_picks.len() / 10).max(1);
+            for (k, _) in items.into_iter().take(cut) {
+                s.word_picks.remove(&k);
+            }
+        }
     }
     *s.word_picks.entry(w.to_string()).or_insert(0) += 1;
 }
@@ -410,21 +453,16 @@ pub fn update_saved(chinese: &str, old_english: &str, new_english: &str) -> Resu
         }
     }
     if hit {
-        // 去重：改完后若与既有条目重复，只保留一条
-        let mut seen: Vec<(String, String)> = Vec::new();
-        s.saved.retain(|p| {
-            let k = (p.chinese.clone(), p.english.clone());
-            if seen.contains(&k) {
-                false
-            } else {
-                seen.push(k);
-                true
-            }
-        });
-        let snap = snapshot(&s);
+        // 去重：改完后若与既有条目重复，只保留一条（HashSet O(n)，原 Vec::contains 是 O(n²)）。
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        s.saved
+            .retain(|p| seen.insert((p.chinese.clone(), p.english.clone())));
+        let dir = s.dir.clone();
+        let fields = store_fields(&s);
         let saved = s.saved.clone();
         drop(s);
-        write_snapshot(&snap)?;
+        write_snapshot(&(dir, db_from(fields)))?;
         sync_memory(&saved);
     }
     Ok(hit)
@@ -433,18 +471,21 @@ pub fn update_saved(chinese: &str, old_english: &str, new_english: &str) -> Resu
 /// 删除单条收藏。
 pub fn delete_saved(chinese: &str, english: &str) -> Result<bool, String> {
     let (cn, en) = (chinese.trim(), english.trim());
-    let mut s = store_guard();
-    let before = s.saved.len();
-    s.saved.retain(|p| !(p.chinese == cn && p.english == en));
-    let hit = s.saved.len() != before;
-    if hit {
-        let snap = snapshot(&s);
-        let saved = s.saved.clone();
+    let done = {
+        let mut s = store_guard();
+        let before = s.saved.len();
+        s.saved.retain(|p| !(p.chinese == cn && p.english == en));
+        let hit = s.saved.len() != before;
+        if !hit {
+            return Ok(false);
+        }
+        let out = (s.dir.clone(), store_fields(&s), s.saved.clone());
         drop(s);
-        write_snapshot(&snap)?;
-        sync_memory(&saved);
-    }
-    Ok(hit)
+        out
+    };
+    write_snapshot(&(done.0, db_from(done.1)))?;
+    sync_memory(&done.2);
+    Ok(true)
 }
 
 /// 记一次上屏（词数 + 当天活跃）。
@@ -479,31 +520,31 @@ pub fn save_phrase(chinese: &str, english: &str) -> Result<SavedPhrase, String> 
     if cn.is_empty() {
         return Err("中文不能为空".to_string());
     }
-    let mut s = store_guard();
-    if let Some(p) = s
-        .saved
-        .iter_mut()
-        .find(|p| p.chinese == cn && p.english == en)
-    {
-        p.saved_at = now_secs();
-        let out = p.clone();
-        let snap = snapshot(&s);
-        drop(s);
-        write_snapshot(&snap)?;
-        return Ok(out);
-    }
-    let p = SavedPhrase {
-        chinese: cn.to_string(),
-        english: en.to_string(),
-        saved_at: now_secs(),
+    let (dir, fields, out, saved) = {
+        let mut s = store_guard();
+        if let Some(p) = s
+            .saved
+            .iter_mut()
+            .find(|p| p.chinese == cn && p.english == en)
+        {
+            p.saved_at = now_secs();
+            let out = p.clone();
+            let done = (s.dir.clone(), store_fields(&s));
+            drop(s);
+            write_snapshot(&(done.0, db_from(done.1)))?;
+            return Ok(out);
+        }
+        let p = SavedPhrase {
+            chinese: cn.to_string(),
+            english: en.to_string(),
+            saved_at: now_secs(),
+        };
+        s.saved.push(p.clone());
+        (s.dir.clone(), store_fields(&s), p, s.saved.clone())
     };
-    s.saved.push(p.clone());
-    let snap = snapshot(&s);
-    let saved = s.saved.clone();
-    drop(s);
-    write_snapshot(&snap)?;
+    write_snapshot(&(dir, db_from(fields)))?;
     sync_memory(&saved);
-    Ok(p)
+    Ok(out)
 }
 
 pub fn list_saved() -> Vec<SavedPhrase> {
@@ -513,12 +554,15 @@ pub fn list_saved() -> Vec<SavedPhrase> {
 }
 
 pub fn clear_saved() -> Result<usize, String> {
-    let mut s = store_guard();
-    let n = s.saved.len();
-    s.saved.clear();
-    let snap = snapshot(&s);
-    drop(s);
-    write_snapshot(&snap)?;
+    let (dir, fields, n) = {
+        let mut s = store_guard();
+        let n = s.saved.len();
+        s.saved.clear();
+        let out = (s.dir.clone(), store_fields(&s), n);
+        drop(s);
+        out
+    };
+    write_snapshot(&(dir, db_from(fields)))?;
     sync_memory(&[]);
     Ok(n)
 }
@@ -529,24 +573,33 @@ pub fn import_names(text: &str) -> Result<usize, String> {
     if names.is_empty() {
         return Err("没有解析到姓名（每行一个，或用逗号分隔）".to_string());
     }
-    let mut s = store_guard();
-    let mut added = 0usize;
-    for name in names {
-        let Some(py) = userdic::name_to_pinyin(&name) else {
-            continue;
-        };
-        if s.user_words.iter().any(|(p, w)| p == &py && w == &name) {
-            continue;
+    let (dir, fields, added) = {
+        let mut s = store_guard();
+        let mut added = 0usize;
+        // O(1) 去重：原来 `iter().any()` 是 O(n²)。
+        let mut have: std::collections::HashSet<(String, String)> = s
+            .user_words
+            .iter()
+            .map(|(p, w)| (p.clone(), w.clone()))
+            .collect();
+        for name in names {
+            let Some(py) = userdic::name_to_pinyin(&name) else {
+                continue;
+            };
+            if !have.insert((py.clone(), name.clone())) {
+                continue;
+            }
+            s.user_words.push((py, name));
+            added += 1;
+            if s.user_words.len() >= 2000 {
+                break;
+            }
         }
-        s.user_words.push((py, name));
-        added += 1;
-        if s.user_words.len() >= 2000 {
-            break;
-        }
-    }
-    let snap = snapshot(&s);
-    drop(s);
-    write_snapshot(&snap)?;
+        let out = (s.dir.clone(), store_fields(&s), added);
+        drop(s);
+        out
+    };
+    write_snapshot(&(dir, db_from(fields)))?;
     Ok(added)
 }
 
@@ -590,22 +643,28 @@ pub fn user_words_for(pinyin: &str, limit: usize) -> Vec<String> {
 }
 
 pub fn clear_user_words() -> usize {
-    let mut s = store_guard();
-    let n = s.user_words.len();
-    s.user_words.clear();
-    let snap = snapshot(&s);
-    drop(s);
-    let _ = write_snapshot(&snap);
+    let (dir, fields, n) = {
+        let mut s = store_guard();
+        let n = s.user_words.len();
+        s.user_words.clear();
+        let out = (s.dir.clone(), store_fields(&s), n);
+        drop(s);
+        out
+    };
+    let _ = write_snapshot(&(dir, db_from(fields)));
     n
 }
 
 /// 记住邮箱域名（用户点过哪个后缀）。
 pub fn remember_mail_domain(domain: &str) -> Result<usize, String> {
     userdic::remember_domain(domain);
-    let s = store_guard();
-    let snap = snapshot(&s);
-    drop(s);
-    write_snapshot(&snap)?;
+    let (dir, fields) = {
+        let s = store_guard();
+        let out = (s.dir.clone(), store_fields(&s));
+        drop(s);
+        out
+    };
+    write_snapshot(&(dir, db_from(fields)))?;
     Ok(userdic::domains_snapshot().len())
 }
 
@@ -614,45 +673,59 @@ pub fn mail_domains() -> Vec<(String, u32)> {
 }
 
 /// 导出整库 JSON（本地备份，无网络无权限）。
+///
+/// 调用方在锁外取引擎快照：持 store 锁同时拿引擎 L0 锁会把选词顶住。
 pub fn export_json() -> Result<String, String> {
-    let s = store_guard();
-    let l0 = engine::export_l0();
-    let db = Db {
-        version: 3,
-        saved: s.saved.clone(),
-        l0: L0File {
-            pins: l0.pins,
-            pick_counts: l0.pick_counts,
-        },
-        settings: s.settings.clone(),
-        stats: s.stats.clone(),
-        corrections: engine::export_learned()
-            .into_iter()
-            .map(|(typed, word, count)| Correction { typed, word, count })
-            .collect(),
-        blocked: engine::export_blocked(),
-        user_words: s.user_words.clone(),
-        mail_domains: userdic::domains_snapshot(),
-        word_picks: word_picks_sorted(&s.word_picks),
+    let fields = {
+        let s = store_guard();
+        let f = store_fields(&s);
+        drop(s);
+        f
     };
-    serde_json::to_string_pretty(&db).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&db_from(fields)).map_err(|e| e.to_string())
 }
 
 /// 从 JSON 恢复整库（覆盖当前数据），返回 (收藏数, pins 数)。
+///
+/// - 超过 5MB 直接拒绝（防剪贴板粘超大串卡死）；
+/// - 先解析 + 校验 `version`，再把当前库备份为 `.bak`，最后才覆盖写 + `init` 重载。
 pub fn import_json(text: &str) -> Result<(usize, usize), String> {
-    serde_json::from_str::<Db>(text).map_err(|e| format!("JSON 解析失败：{e}"))?;
+    if text.len() > 5 * 1024 * 1024 {
+        return Err("备份过大（>5MB），已拒绝恢复".to_string());
+    }
+    let db = serde_json::from_str::<Db>(text).map_err(|e| format!("JSON 解析失败：{e}"))?;
+    if db.version != 3 {
+        return Err(format!("不支持的备份版本：{}（需要 3）", db.version));
+    }
     let dir = store_guard().dir.clone();
     if dir.is_empty() {
         return Err("存储目录未初始化".to_string());
+    }
+    // 先备份当前库（.bak），恢复失败还能找回。
+    if let Ok(cur) = std::fs::read(db_path(&dir)) {
+        let _ = write_atomic(&db_path(&dir).with_extension("json.bak"), &cur);
     }
     write_atomic(&db_path(&dir), text.as_bytes()).map_err(|e| e.to_string())?;
     init(&dir)
 }
 
 /// 学习/设置数据落盘（选词、纠错记忆、收尾 flush 时调用）。锁外写盘。
+/// 高频路径节流：距上次成功落盘 <2s 则跳过，由 `flushStorage` 强制兜底。
 pub fn persist() -> Result<(), String> {
     // 锁内只拷字段，锁外再排序/取引擎/序列化：生词本最多 4 万条，
     // 拿着全局 store 锁做这些事会把每次上屏都变成一个串行点。
+    let now = now_ms();
+    let last = LAST_PERSIST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 2000 {
+        return Ok(());
+    }
+    persist_forced()?;
+    LAST_PERSIST_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// 不节流的落盘（设置变更 / `flushStorage` / 收藏变更用）。
+pub fn persist_forced() -> Result<(), String> {
     let (dir, fields) = {
         let s = store_guard();
         if s.dir.is_empty() {
@@ -660,7 +733,13 @@ pub fn persist() -> Result<(), String> {
         }
         (s.dir.clone(), store_fields(&s))
     };
-    write_snapshot(&(dir, db_from(fields)))
+    let r = write_snapshot(&(dir, db_from(fields)));
+    if r.is_ok() {
+        LAST_PERSIST_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    } else if let Err(ref e) = r {
+        crate::engine::note_error(&format!("落盘失败：{e}"));
+    }
+    r
 }
 
 #[cfg(test)]
@@ -813,13 +892,32 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_file_does_not_panic() {
+    fn corrupted_file_is_quarantined_not_dropped() {
         let _g = lock();
         let dir = tmp_dir("corrupt");
         std::fs::write(db_path(&dir), b"{not json").unwrap();
         let (n, _) = init(&dir).unwrap();
         assert_eq!(n, 0);
         assert_eq!(stats().words, 0);
+        // 原文件改名保留取证，不再是坏 JSON 本体。
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|n| n.contains("corrupt")),
+            "got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_and_bad_version_backup_is_rejected() {
+        let _g = lock();
+        let dir = tmp_dir("import-guard");
+        init(&dir).unwrap();
+        assert!(import_json(&"x".repeat(6 * 1024 * 1024)).is_err());
+        assert!(import_json(r#"{"version":99}"#).is_err());
     }
 
     #[test]

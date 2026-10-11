@@ -70,12 +70,29 @@ fn build(text: &str) -> Vec<Piece> {
     if chars.is_empty() || chars.len() > 24 {
         return Vec::new();
     }
+    // 整次切词只拿一次大词典锁：原来每个字位 `longest()` 锁一次，
+    // 24 字候选 ×6 长度 = 上百次加锁，每键都被放大。
+    let dict = crate::english::big_dict_snapshot();
     let mut out: Vec<Piece> = Vec::new();
     let mut i = 0usize;
     let mut covered = 0usize;
     let mut skipped = 0usize;
+    let mut probe = String::new();
     while i < chars.len() && out.len() < MAX_PIECES {
-        match longest(&chars, i) {
+        let found = {
+            let max = (chars.len() - i).min(MAX_WORD);
+            let mut hit: Option<(usize, String)> = None;
+            for len in (1..=max).rev() {
+                probe.clear();
+                probe.extend(chars[i..i + len].iter());
+                if let Some(en) = dict.get(probe.as_str()) {
+                    hit = Some((len, en.clone()));
+                    break;
+                }
+            }
+            hit
+        };
+        match found {
             Some((len, en)) => {
                 let zh: String = chars[i..i + len].iter().collect();
                 let en = first_sense(&en);
@@ -108,6 +125,8 @@ fn build(text: &str) -> Vec<Piece> {
 }
 
 /// 从 `start` 起做最长匹配（1..=6 字），返回 (长度, 词典英文)。
+/// 保留供单测/外部调用；热路径 `build()` 用快照批量查（只锁一次）。
+#[allow(dead_code)]
 fn longest(chars: &[char], start: usize) -> Option<(usize, String)> {
     let max = (chars.len() - start).min(MAX_WORD);
     for len in (1..=max).rev() {
@@ -175,6 +194,7 @@ pub fn gloss_line(zh: &str) -> Option<(String, &'static str)> {
 // ---------------- 释义加工 ----------------
 
 /// 只留第 1 个义项，并剥掉开头的括注。
+/// 左括号无右括号（如 `(foo`）按“宁缺毋滥”返回空串，不把半截标注上屏。
 fn first_sense(en: &str) -> String {
     let mut s = en.split(';').next().unwrap_or("").trim();
     // 连续剥掉开头的 `(...)` / `[...]` 标注，如 `(coll.) to eat`
@@ -183,7 +203,8 @@ fn first_sense(en: &str) -> String {
         if t.len() > 2 && (t.starts_with('(') || t.starts_with('[')) {
             match t.find([')', ']']) {
                 Some(i) if i > 1 => s = t[i + 1..].trim_start(),
-                _ => break,
+                // 无配对右括号：整条丢弃，不返回半截 `(foo`。
+                _ => return String::new(),
             }
         } else {
             break;
@@ -335,10 +356,12 @@ fn level_of(en: &str) -> &'static str {
 }
 
 /// 从释义里取出要统计/查级的英文词（小写、去标点、跳过虚词与短词）。
+/// 阈值 2（原来 3 会漏掉 `ox/cat/dog` 类短词；单字母仍丢掉，`a/I` 无分级意义）。
 fn content_words(en: &str) -> Vec<String> {
     en.split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|w| w.len() >= 3)
+        .filter(|w| w.len() >= 2)
         .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() > 1)
         .filter(|w| !STOP.contains(&w.as_str()))
         .collect()
 }
@@ -464,6 +487,12 @@ mod tests {
         assert!(w.contains(&"happy".to_string()));
         assert!(w.contains(&"cat".to_string()));
         assert!(!w.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn unmatched_paren_is_dropped_not_shown() {
+        assert_eq!(first_sense("(foo"), "");
+        assert_eq!(first_sense("(coll.) to eat"), "to eat");
     }
 
     #[test]

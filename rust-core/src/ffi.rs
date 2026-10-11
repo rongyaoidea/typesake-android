@@ -7,7 +7,7 @@
 //! - 冷路径（收藏/统计/初始化）返回 JSON；
 //! - **所有导出函数都经 [`guarded`] 包裹**：Rust panic 不跨 FFI，最坏返回空串。
 //! - 入参转换 [`jstr_to_rust`] 与出参转换 [`rust_to_jstr`] 自身永不 panic
-//!  （null 入参/pending exception/OOM 全降级为空串或 null JString），
+//!   （null 入参/pending exception/OOM 全降级为空串或 null JString），
 //!   因此在 `guarded` 之外调用也是安全的。
 
 use crate::{engine, english, store};
@@ -31,7 +31,6 @@ pub const REC_SEP: char = '\u{1D}';
 /// - JVM 已有 pending exception -> 空串（不清异常，让调用方决定）；
 /// - `get_string` / `to_str` 失败 -> 空串（不 `unwrap` / `expect`）。
 fn jstr_to_rust(env: &mut JNIEnv, s: &JString) -> String {
-    use jni::objects::JObject;
     if s.is_null() {
         return String::new();
     }

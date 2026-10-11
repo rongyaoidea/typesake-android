@@ -834,8 +834,8 @@ pub(crate) fn big_dict_snapshot() -> HashMap<String, String> {
 /// 英文词表：精确判存用 `set`，纠错扫描只走 `buckets[len±budget]`。
 /// 原来每键全表 8 万扫描 + 每次 DP，低端机必掉帧。
 struct EnWords {
-    set: std::collections::BTreeSet<String>,
-    buckets: std::collections::HashMap<usize, Vec<String>>,
+    set: BTreeSet<String>,
+    buckets: HashMap<usize, Vec<String>>,
 }
 
 fn en_cell() -> &'static RwLock<Option<Arc<EnWords>>> {
@@ -1018,7 +1018,7 @@ pub fn verb_ing(v: &str) -> String {
     let chars: Vec<char> = w.chars().collect();
     let n = chars.len();
     // 长度 >5 的多音节词默认不双写（begin/commit 这类真双写的走不规则/常用表，宁可少双写不错双写）。
-    if n >= 3 && n <= 5 {
+    if (3..=5).contains(&n) {
         let (a, b, c) = (chars[n - 3], chars[n - 2], chars[n - 1]);
         if !is_vowel(a) && is_vowel(b) && !is_vowel(c) && c != 'w' && c != 'x' && c != 'y' {
             return format!("{w}{c}ing");
@@ -1049,7 +1049,7 @@ pub fn verb_past(v: &str) -> String {
     }
     let chars: Vec<char> = w.chars().collect();
     let n = chars.len();
-    if n >= 3 && n <= 5 {
+    if (3..=5).contains(&n) {
         let (a, b, c) = (chars[n - 3], chars[n - 2], chars[n - 1]);
         if !is_vowel(a) && is_vowel(b) && !is_vowel(c) && !"wxhy".contains(c) {
             return format!("{w}{c}ed");
@@ -1870,8 +1870,7 @@ pub fn suggest(text: &str) -> String {
 fn past_tense_hint(lower: &str) -> bool {
     let last = lower
         .split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|w| !w.is_empty())
-        .next_back()
+        .rfind(|w| !w.is_empty())
         .unwrap_or("");
     last.len() >= 5 && last.ends_with("ed")
 }

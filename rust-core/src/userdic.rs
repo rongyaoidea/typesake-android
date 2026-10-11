@@ -98,7 +98,7 @@ pub fn remember_domain(domain: &str) -> Vec<(String, u32)> {
     {
         return domains_snapshot();
     }
-    let mut out = Vec::new();
+    let out: Vec<(String, u32)>;
     {
         let mut list = domains().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = list.iter_mut().find(|(x, _)| *x == d) {

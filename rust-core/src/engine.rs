@@ -744,16 +744,26 @@ fn neighbors(c: char) -> &'static [char] {
 const INSERT_CHARS: &[char] = &['a', 'e', 'i', 'o', 'u', 'n', 'g', 'h'];
 
 /// 击键变体上限：再往下每个变体都要跑一次廉价查询，收益递减。
-/// 按代价分层（换位/邻键 24，删键 8，插键 8）：原来先截断后排序，
-/// 长串前两类就填满 40，漏键（cost 3）对 ≥7 字母输入实际永不生效。
-const COST1_BUDGET: usize = 24;
+/// 按代价分层：原来先截断后排序，长串前两类就填满 40，
+/// 漏键（cost 3）对长输入实际永不生效。
+/// cost1 预算随输入长度放宽（短串的邻键替换必须全保留，如 `nihap`→`nihao` 是
+/// 末位替换，固定 24 会把它挤掉），上限 48 控制每键查询总数。
+const COST1_BASE: usize = 24;
+const COST1_PER_CHAR: usize = 2;
+const COST1_MAX: usize = 48;
 const COST2_BUDGET: usize = 8;
 const COST3_BUDGET: usize = 8;
 
 /// 收一个击键变体：哈希去重 + 按代价分层预算收手（预算满了直接跳过该层）。
-fn push_variant(out: &mut Vec<(u8, String)>, seen: &mut HashSet<String>, cost: u8, v: String) {
+fn push_variant(
+    out: &mut Vec<(u8, String)>,
+    seen: &mut HashSet<String>,
+    cost: u8,
+    cost1_budget: usize,
+    v: String,
+) {
     let budget = match cost {
-        1 => COST1_BUDGET,
+        1 => cost1_budget,
         2 => COST2_BUDGET,
         3 => COST3_BUDGET,
         _ => COST3_BUDGET,
@@ -777,6 +787,7 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
     // `seen.contains` 线性扫，换成哈希查找后同一串输入的分配和比较都少一个量级。
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<(u8, String)> = Vec::new();
+    let cost1_budget = (COST1_BASE + chars.len() * COST1_PER_CHAR).min(COST1_MAX);
     // cost 1: 相邻换位
     for i in 0..chars.len() - 1 {
         if chars[i] == chars[i + 1] {
@@ -786,7 +797,7 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
         v.swap(i, i + 1);
         let s: String = v.into_iter().collect();
         if s != input {
-            push_variant(&mut out, &mut seen, 1, s);
+            push_variant(&mut out, &mut seen, 1, cost1_budget, s);
         }
     }
     // cost 1: 邻键替换
@@ -794,7 +805,13 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
         for n in neighbors(chars[i]) {
             let mut v = chars.clone();
             v[i] = *n;
-            push_variant(&mut out, &mut seen, 1, v.into_iter().collect());
+            push_variant(
+                &mut out,
+                &mut seen,
+                1,
+                cost1_budget,
+                v.into_iter().collect(),
+            );
         }
     }
     // cost 2: 多按一键 -> 删一个
@@ -804,7 +821,13 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
         }
         let mut v = chars.clone();
         v.remove(i);
-        push_variant(&mut out, &mut seen, 2, v.into_iter().collect());
+        push_variant(
+            &mut out,
+            &mut seen,
+            2,
+            cost1_budget,
+            v.into_iter().collect(),
+        );
     }
     // cost 3: 漏按一键 -> 插一个
     'outer: for i in 0..=chars.len() {
@@ -814,7 +837,13 @@ pub fn keystroke_variants(input: &str) -> Vec<(u8, String)> {
             }
             let mut v = chars.clone();
             v.insert(i, *c);
-            push_variant(&mut out, &mut seen, 3, v.into_iter().collect());
+            push_variant(
+                &mut out,
+                &mut seen,
+                3,
+                cost1_budget,
+                v.into_iter().collect(),
+            );
         }
     }
 
@@ -1168,20 +1197,13 @@ mod tests {
     #[test]
     fn fuzzy_pairs_cover_all() {
         let _g = gated();
-        // README 承诺的模糊音对，每对至少一个方向可纠错（用真实词验证，不只 z/zh）。
-        for (typo, expect) in [
-            ("zongguo", "zhongguo"), // zh->z
-            ("zhonguo", "zhongguo"), // z->zh（漏 h，击键层兜底也应命中）
-            ("caihong", "caihong"),  // ch/c 对称：正确串不应被误纠
-            ("nili", "nili"),        // n/l 对称：正确串直出
-            ("ganjue", "ganjue"),    // an/ang 对称
-        ] {
+        // README 承诺的模糊音对：错拼有候选、正确串直出不断流。
+        for typo in ["zongguo", "zhonguo", "caihong", "nili", "ganjue"] {
             let m = analyze(typo, 8);
             assert!(
                 !m.candidates.is_empty(),
                 "{typo} should have candidates, got {m:?}"
             );
-            let _ = expect;
         }
         // 垃圾变体过滤：s->sh 不应把 shong 变成 shhong。
         assert!(!fuzzy_variants("shong").iter().any(|v| v.contains("shh")));

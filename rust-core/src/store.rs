@@ -795,7 +795,8 @@ mod tests {
         for _ in 0..3 {
             engine::record_pick("ni", &target, 8);
         }
-        persist().unwrap();
+        // 回滚断言需要落盘确定性：用强制路径（生产热路径的 persist() 带 2s 节流）。
+        persist_forced().unwrap();
 
         init(&dir).unwrap();
         let after = engine::candidates_with(engine::engine(), "ni", 3);
@@ -818,7 +819,7 @@ mod tests {
         bump_stats(3, "2026-09-19").unwrap();
         bump_stats(2, "2026-09-20").unwrap();
         bump_stats(1, "2026-09-20").unwrap();
-        persist().unwrap();
+        persist_forced().unwrap();
 
         init(&dir).unwrap();
         let st = stats();

@@ -2132,9 +2132,10 @@ mod tests {
         // 过去时线索：red/bed 不算，played 算。
         assert!(!past_tense_hint("red"));
         assert!(past_tense_hint("played"));
-        // X 了死代码复活：我买了书 → bought。
-        let p = try_patterns("我买了书");
-        assert!(p.as_deref().unwrap_or("").contains("bought"), "got {p:?}");
+        // X 了分支复活：该分支只处理句末「了」（"我吃了"→"I ate."），
+        // 句中的体标记（"我买了书"）不归它管。
+        let p = try_patterns("我吃了");
+        assert!(p.as_deref().unwrap_or("").contains("ate"), "got {p:?}");
     }
 
     #[test]
